@@ -468,11 +468,22 @@ msgstr ""
 "\n"
 "我跑什么软件有区别吗？有，只有上游 openpilot（及特定分支）可用于训练。"
 
-#: system/ui/widgets/network.py:458
-#: system/ui/widgets/network.py:326
+#: system/ui/widgets/network.py
 #, python-format
 msgid "Forget"
 msgstr "忘记"
+
+#: system/ui/widgets/network.py
+msgid "Disconnect"
+msgstr "断开连接"
+
+#: system/ui/widgets/network.py
+msgid "DISCONNECTING..."
+msgstr "正在断开..."
+
+#: system/ui/widgets/network.py
+msgid "CONNECT"
+msgstr "连接"
 
 #: system/ui/widgets/network.py:327
 #, python-format
