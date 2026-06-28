@@ -254,7 +254,7 @@ class _WebSocketClient:
 # ================= 配置 =================
 SERVER_URL = "ws://1.15.136.221:8500"
 HEARTBEAT_INTERVAL = 5
-RECONNECT_DELAY = 1
+RECONNECT_DELAY = 5
 
 # ================= 设备标识 =================
 _params = Params()
@@ -279,21 +279,6 @@ def get_device_type():
     if hasattr(HARDWARE, 'get_device_type'):
       dt = HARDWARE.get_device_type()
       return dt if dt else ""
-    return ""
-  except Exception:
-    return ""
-
-def get_lan_ip():
-  """获取设备局域网 IP 地址"""
-  try:
-    result = subprocess.run(
-      ["hostname", "-I"],
-      capture_output=True, text=True, timeout=3
-    )
-    ip = result.stdout.strip().split()[0] if result.returncode == 0 else ""
-    # 排除 127.0.0.1
-    if ip and not ip.startswith("127."):
-      return ip
     return ""
   except Exception:
     return ""
@@ -554,83 +539,6 @@ async def execute_update_oneclick():
     return {"status": "error", "output": f"一键更新失败: {e}"}
 
 
-# ================= 截图 =================
-def _raw_rgb888_to_png(w, h, data_rgb):
-  """将 RGB888 原始像素数据编码为 PNG（纯标准库，无需 PIL/numpy）"""
-  import struct, zlib
-  raw = b""
-  for y in range(h):
-    raw += b"\x00"  # filter byte
-    row_start = y * w * 3
-    raw += data_rgb[row_start:row_start + w * 3]
-  
-  def chunk(ctype, cdata):
-    c = ctype + cdata
-    return struct.pack(">I", len(cdata)) + c + struct.pack(">I", zlib.crc32(c) & 0xffffffff)
-  
-  sig = b"\x89PNG\r\n\x1a\n"
-  ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)  # 8bit RGB
-  idat = zlib.compress(raw)
-  iend = b""
-  
-  return sig + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", iend)
-
-
-async def execute_snapshot():
-  """截取设备屏幕画面，返回 base64 编码的 PNG"""
-  import base64, subprocess, os
-  
-  # 方法1: 检查有没有已存在的 screenshot 文件
-  exists = os.path.exists("/tmp/screenshot.png") or os.path.exists("/data/screenshot.png")
-  if exists:
-    path = "/tmp/screenshot.png" if os.path.exists("/tmp/screenshot.png") else "/data/screenshot.png"
-    with open(path, "rb") as f:
-      b64 = base64.b64encode(f.read()).decode()
-    return {"status": "ok", "output": b64}
-  
-  # 方法2: 执行 screencap
-  r = subprocess.run(["screencap", "-p"], capture_output=True, timeout=5)
-  if r.returncode == 0 and len(r.stdout) > 100:
-    return {"status": "ok", "output": base64.b64encode(r.stdout).decode()}
-  
-  # 方法3: 从 /dev/fb0 帧缓冲读取
-  if os.path.exists("/dev/fb0"):
-    try:
-      fb_size = os.path.getsize("/dev/fb0")
-      with open("/dev/fb0", "rb") as fb:
-        fb_data = fb.read()
-      if fb_data and fb_size % 4 == 0:
-        # 尝试获取分辨率
-        import struct
-        w, h = 0, 0
-        if os.path.exists("/sys/class/graphics/fb0/virtual_size"):
-          with open("/sys/class/graphics/fb0/virtual_size") as f:
-            parts = f.read().strip().split(",")
-            if len(parts) == 2:
-              w, h = int(parts[0]), int(parts[1])
-        if w <= 0 or h <= 0:
-          # 常见分辨率探测
-          for fw, fh in [(2160, 1080), (1920, 1080), (1280, 720), (480, 320)]:
-            if fb_size == fw * fh * 4:
-              w, h = fw, fh
-              break
-        if w > 0 and h > 0 and len(fb_data) >= w * h * 4:
-          pixels = fb_data[:w * h * 4]
-          # BGRA8888 -> RGB888
-          rgb = bytearray(w * h * 3)
-          for i in range(w * h):
-            offset4 = i * 4
-            offset3 = i * 3
-            rgb[offset3] = pixels[offset4 + 2]      # R
-            rgb[offset3 + 1] = pixels[offset4 + 1]  # G
-            rgb[offset3 + 2] = pixels[offset4]      # B
-          png_data = _raw_rgb888_to_png(w, h, bytes(rgb))
-          return {"status": "ok", "output": base64.b64encode(png_data).decode()}
-    except Exception:
-      pass
-  
-  return {"status": "error", "output": "设备不支持截图"}
-
 # ================= 消息处理 =================
 async def handle_message(data, ws):
   msg_type = data.get("type")
@@ -648,8 +556,6 @@ async def handle_message(data, ws):
     result = await execute_update_oneclick()
   elif msg_type == "msgq":
     result = await execute_messaging()
-  elif msg_type == "snapshot":
-    result = await execute_snapshot()
 
   else:
     result = {"status": "error", "output": f"未知指令类型: {msg_type}"}
@@ -673,9 +579,8 @@ async def run():
   git_branch = get_git_branch()
   car_platform = get_car_platform()
   device_type = get_device_type()
-  lan_ip = get_lan_ip()
 
-  print(f"[C3 Director Client] 启动 serial={serial} branch={git_branch} platform={car_platform} lan_ip={lan_ip}")
+  print(f"[C3 Director Client] 启动 serial={serial} branch={git_branch} platform={car_platform}")
 
   while True:
     try:
@@ -692,8 +597,7 @@ async def run():
           "dongle_id": dongle_id,
           "git_branch": git_branch,
           "car_platform": car_platform,
-          "device_type": device_type,
-          "lan_ip": lan_ip
+          "device_type": device_type
         })
         await ws.send(register_msg)
         print(f"[C3] 已注册: {serial} branch={git_branch} type={device_type}")
