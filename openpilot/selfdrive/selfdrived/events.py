@@ -304,8 +304,8 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.PERMANENT: Alert(
       "BRAKE!",
       "Emergency Braking: Risk of Collision",
-      AlertStatus.critical, AlertSize.full,
-      Priority.HIGHEST, VisualAlert.fcw, AudibleAlert.none, 2.),
+      AlertStatus.normal, AlertSize.none,
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, .2),
     ET.NO_ENTRY: NoEntryAlert("AEB: Risk of Collision"),
   },
 
@@ -313,8 +313,8 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.PERMANENT: Alert(
       "BRAKE!",
       "Stock AEB: Risk of Collision",
-      AlertStatus.critical, AlertSize.full,
-      Priority.HIGHEST, VisualAlert.fcw, AudibleAlert.none, 2.),
+      AlertStatus.normal, AlertSize.none,
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, .2),
     ET.NO_ENTRY: NoEntryAlert("Stock AEB: Risk of Collision"),
   },
 
@@ -326,8 +326,8 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.PERMANENT: Alert(
       "BRAKE!",
       "Risk of Collision",
-      AlertStatus.critical, AlertSize.full,
-      Priority.HIGHEST, VisualAlert.fcw, AudibleAlert.warningSoft, 2.),
+      AlertStatus.normal, AlertSize.none,
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, .2),
   },
 
   EventName.ldw: {
@@ -352,8 +352,8 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.PERMANENT: Alert(
       "Pay Attention",
       "",
-      AlertStatus.normal, AlertSize.small,
-      Priority.LOW, VisualAlert.none, AudibleAlert.preAlert, .1),
+      AlertStatus.normal, AlertSize.none,
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, .1),
   },
 
   EventName.driverDistracted2: {
@@ -453,7 +453,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "Take Control",
       "Turn Exceeds Steering Limit",
       AlertStatus.userPrompt, AlertSize.mid,
-      Priority.LOW, VisualAlert.steerRequired, AudibleAlert.promptRepeat, 2.),
+      Priority.LOW, VisualAlert.steerRequired, AudibleAlert.none, .1),
   },
 
   # Thrown when the fan is driven at >50% but is not rotating
@@ -611,7 +611,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "Sensor Data Invalid",
       "Possible Hardware Issue",
       AlertStatus.normal, AlertSize.mid,
-      Priority.LOWER, VisualAlert.none, AudibleAlert.none, .2, creation_delay=1.),
+      Priority.LOWER, VisualAlert.none, AudibleAlert.none, .2, creation_delay=1000000000000000.),
     ET.NO_ENTRY: NoEntryAlert("Sensor Data Invalid"),
     ET.SOFT_DISABLE: soft_disable_alert("Sensor Data Invalid"),
   },
@@ -635,8 +635,11 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
 
   EventName.wrongGear: {
-    ET.SOFT_DISABLE: user_soft_disable_alert("Gear not D"),
-    ET.NO_ENTRY: NoEntryAlert("Gear not D"),
+    ET.PERMANENT: Alert(
+      "Gear not D",
+      "",
+      AlertStatus.normal, AlertSize.none,
+      Priority.LOWEST, VisualAlert.none, AudibleAlert.none, .1),
   },
 
   # This alert is thrown when the calibration angles are outside of the acceptable range.
@@ -663,13 +666,19 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
 
   EventName.doorOpen: {
-    ET.SOFT_DISABLE: user_soft_disable_alert("Door Open"),
-    ET.NO_ENTRY: NoEntryAlert("Door Open"),
+    ET.PERMANENT: Alert(
+      "Door Open",
+      "",
+      AlertStatus.normal, AlertSize.none,
+      Priority.LOWEST, VisualAlert.none, AudibleAlert.none, .1),
   },
 
   EventName.seatbeltNotLatched: {
-    ET.SOFT_DISABLE: user_soft_disable_alert("Seatbelt Unlatched"),
-    ET.NO_ENTRY: NoEntryAlert("Seatbelt Unlatched"),
+    ET.PERMANENT: Alert(
+      "Seatbelt Unlatched",
+      "",
+      AlertStatus.normal, AlertSize.none,
+      Priority.LOWEST, VisualAlert.none, AudibleAlert.none, .1),
   },
 
   EventName.espDisabled: {
