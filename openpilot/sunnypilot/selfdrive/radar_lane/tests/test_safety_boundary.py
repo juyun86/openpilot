@@ -44,6 +44,15 @@ def test_control_and_existing_radar_paths_do_not_consume_lane_occupancy():
     assert "radarLaneStateSP" not in _read(relative_path), relative_path
 
 
+def test_lane_occupancy_has_a_ui_consumer_without_becoming_control_input():
+  ui_state = _read("openpilot/selfdrive/ui/sunnypilot/ui_state.py")
+  renderer = _read("openpilot/selfdrive/ui/onroad/model_renderer.py")
+
+  assert '"radarLaneStateSP"' in ui_state
+  assert "select_lane_display_targets(radar_lane_state.targets)" in renderer
+  assert "format_target_label" in renderer
+
+
 if __name__ == "__main__":
   tests = [value for name, value in globals().items() if name.startswith("test_") and callable(value)]
   for test in tests:

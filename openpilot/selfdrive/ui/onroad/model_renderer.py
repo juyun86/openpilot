@@ -8,8 +8,14 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
 from openpilot.selfdrive.locationd.calibrationd import HEIGHT_INIT
 from openpilot.selfdrive.ui.ui_state import ui_state
-from openpilot.system.ui.lib.application import gui_app
+from openpilot.sunnypilot.selfdrive.radar_lane.display import (
+  format_target_label,
+  rendered_radar_track_ids,
+  select_lane_display_targets,
+)
+from openpilot.system.ui.lib.application import FontWeight, gui_app
 from openpilot.system.ui.lib.shader_polygon import draw_polygon, Gradient
+from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.widgets import Widget
 
 from openpilot.selfdrive.ui.sunnypilot.onroad.model_renderer import ChevronMetrics, ModelRendererSP
@@ -44,6 +50,16 @@ class LeadVehicle:
   fill_alpha: int = 0
 
 
+@dataclass(frozen=True)
+class RadarLaneMarker:
+  point: tuple[float, float]
+  d_rel: float
+  v_rel: float
+  label: str
+  cut_in: bool
+  draw_arrow: bool
+
+
 class ModelRenderer(Widget, ChevronMetrics, ModelRendererSP):
   def __init__(self):
     Widget.__init__(self)
@@ -56,6 +72,8 @@ class ModelRenderer(Widget, ChevronMetrics, ModelRendererSP):
     self._lane_line_probs = np.zeros(4, dtype=np.float32)
     self._road_edge_stds = np.zeros(2, dtype=np.float32)
     self._lead_vehicles = [LeadVehicle(), LeadVehicle()]
+    self._radar_lane_markers: list[RadarLaneMarker] = []
+    self._radar_lane_font = gui_app.font(FontWeight.SEMI_BOLD)
     self._path_offset_z = HEIGHT_INIT[0]
     self._counter = -1
     self._camera_offset = ui_state.params.get("CameraOffset", return_default=True) if ui_state.active_bundle else 0.0
@@ -114,12 +132,13 @@ class ModelRenderer(Widget, ChevronMetrics, ModelRendererSP):
 
     model = sm['modelV2']
     radar_state = sm['radarState'] if sm.valid['radarState'] else None
+    radar_lane_state = sm['radarLaneStateSP'] if sm.valid['radarLaneStateSP'] else None
     lead_one = radar_state.leadOne if radar_state else None
     render_lead_indicator = self._longitudinal_control and radar_state is not None
 
     # Update model data when needed
     model_updated = sm.updated['modelV2']
-    if model_updated or sm.updated['radarState'] or self._transform_dirty:
+    if model_updated or sm.updated['radarState'] or sm.updated['radarLaneStateSP'] or self._transform_dirty:
       if model_updated:
         self._update_raw_points(model)
 
@@ -130,6 +149,9 @@ class ModelRenderer(Widget, ChevronMetrics, ModelRendererSP):
       self._update_model(lead_one, path_x_array)
       if render_lead_indicator:
         self._update_leads(radar_state, path_x_array)
+      self._update_radar_lane_markers(
+        radar_lane_state, path_x_array, float(sm['carState'].vEgo), radar_state if render_lead_indicator else None,
+      )
       self._transform_dirty = False
 
     # Draw elements
@@ -139,6 +161,7 @@ class ModelRenderer(Widget, ChevronMetrics, ModelRendererSP):
     if render_lead_indicator and radar_state:
       self._draw_lead_indicator()
       self.chevron_metrics.draw_lead_status(sm, radar_state, self._rect, self._lead_vehicles)
+    self._draw_radar_lane_markers()
 
   def _update_raw_points(self, model):
     """Update raw 3D points from model data"""
@@ -169,6 +192,34 @@ class ModelRenderer(Widget, ChevronMetrics, ModelRendererSP):
         point = self._map_to_screen(d_rel, -y_rel + self._camera_offset, z + self._path_offset_z)
         if point:
           self._lead_vehicles[i] = self._update_lead_vehicle(d_rel, v_rel, point, self._rect)
+
+  def _update_radar_lane_markers(self, radar_lane_state, path_x_array, v_ego: float, drawn_radar_state=None) -> None:
+    self._radar_lane_markers = []
+    if radar_lane_state is None or not radar_lane_state.radarFresh or not radar_lane_state.modelFresh:
+      return
+
+    drawn_track_ids = rendered_radar_track_ids(drawn_radar_state)
+
+    for target in select_lane_display_targets(radar_lane_state.targets):
+      d_rel = float(target.dRel)
+      if not 2.5 < d_rel <= MAX_DRAW_DISTANCE:
+        continue
+      idx = self._get_path_length_idx(path_x_array, d_rel)
+      z = self._path.raw_points[idx, 2] if idx < len(self._path.raw_points) else 0.0
+      point = self._map_to_screen(d_rel, -float(target.yRel) + self._camera_offset, z + self._path_offset_z)
+      if point is None:
+        continue
+      self._radar_lane_markers.append(RadarLaneMarker(
+        point=point,
+        d_rel=d_rel,
+        v_rel=float(target.vRel),
+        label=format_target_label(d_rel, float(target.vRel), v_ego, ui_state.is_metric),
+        cut_in=bool(target.cutInCandidate),
+        draw_arrow=int(target.trackId) not in drawn_track_ids,
+      ))
+
+    # Draw farther targets first so a close target remains legible when projections overlap.
+    self._radar_lane_markers.sort(key=lambda marker: marker.d_rel, reverse=True)
 
   def _update_model(self, lead, path_x_array):
     """Update model visualization data based on model message"""
@@ -322,6 +373,41 @@ class ModelRenderer(Widget, ChevronMetrics, ModelRendererSP):
 
       rl.draw_triangle_fan(lead.glow, len(lead.glow), rl.Color(218, 202, 37, 255))
       rl.draw_triangle_fan(lead.chevron, len(lead.chevron), rl.Color(201, 34, 49, lead.fill_alpha))
+
+  def _draw_radar_lane_markers(self) -> None:
+    for marker in self._radar_lane_markers:
+      x, y = marker.point
+      size = float(np.clip(58.0 - marker.d_rel * 0.28, 26.0, 52.0))
+      if marker.cut_in:
+        color = rl.Color(255, 48, 48, 245)
+      elif marker.v_rel < -0.5:
+        color = rl.Color(255, 175, 3, 235)
+      else:
+        color = rl.Color(0, 203, 0, 225)
+
+      if marker.draw_arrow:
+        arrow = [(x - size, y - size * 0.55), (x, y + size * 0.45), (x + size, y - size * 0.55)]
+        rl.draw_triangle_fan(arrow, len(arrow), color)
+
+      font_size = 27
+      text_size = measure_text_cached(self._radar_lane_font, marker.label, font_size)
+      padding_x, padding_y = 10.0, 5.0
+      box = rl.Rectangle(
+        float(np.clip(x - text_size.x / 2.0 - padding_x, self._rect.x, self._rect.x + self._rect.width - text_size.x - 2 * padding_x)),
+        float(np.clip(y + size * 0.55, self._rect.y, self._rect.y + self._rect.height - text_size.y - 2 * padding_y)),
+        text_size.x + 2 * padding_x,
+        text_size.y + 2 * padding_y,
+      )
+      rl.draw_rectangle_rounded(box, 0.28, 8, rl.Color(0, 0, 0, 190))
+      rl.draw_rectangle_rounded_lines_ex(box, 0.28, 8, 2.0, color)
+      rl.draw_text_ex(
+        self._radar_lane_font,
+        marker.label,
+        rl.Vector2(box.x + padding_x, box.y + padding_y),
+        font_size,
+        0,
+        rl.Color(255, 255, 255, 255),
+      )
 
   @staticmethod
   def _get_path_length_idx(pos_x_array: np.ndarray, path_distance: float) -> int:

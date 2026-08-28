@@ -49,3 +49,10 @@ lane identifiers. Consumers must require a live service and valid event, treat
 `unknown` as unconfirmed, and must not carry a lane identity across a lane
 change. `clear` does not prove complete sensor coverage and is not a substitute
 for side/rear blind-spot monitoring.
+
+The standard C3XL on-road renderer subscribes to this service and displays at
+most one unique representative target per lane. A predicted cut-in target has
+priority over the closest target. Each marker shows distance and estimated
+longitudinal target speed (`vEgo + vRel`); this is a radar-relative estimate,
+not a wheel-speed measurement from the other vehicle. Red marks a cut-in
+candidate, orange a closing target, and green a non-closing target.
