@@ -164,7 +164,8 @@ class SelfdriveD(CruiseHelper):
     self.state_machine = StateMachine()
     self.rk = Ratekeeper(100, print_delay_threshold=None)
 
-    self.ignored_processes = {'mapd', }
+    # Read-only enrichment processes must never gate engagement or continuity.
+    self.ignored_processes = {'mapd', 'radarlanesd'}
 
     # Determine startup event
     is_remote = build_metadata.openpilot.comma_remote or build_metadata.openpilot.sunnypilot_remote

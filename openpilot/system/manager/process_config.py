@@ -66,6 +66,9 @@ def always_run(started: bool, params: Params, CP: car.CarParams) -> bool:
 def only_onroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started
 
+def radar_lane_available(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return started and not CP.notCar and not CP.radarUnavailable
+
 def record_route_video(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and params.get_bool("RecordRoadVideo")
 
@@ -195,6 +198,9 @@ procs += [
   # Models
   PythonProcess("models_manager", "openpilot.sunnypilot.models.manager", only_offroad),
   NativeProcess("modeld_tinygrad", "openpilot/sunnypilot/modeld_v2", ["./modeld"], and_(only_onroad, is_tinygrad_model)),
+
+  # Radar
+  PythonProcess("radarlanesd", "openpilot.sunnypilot.selfdrive.radar_lane.radarlanesd", radar_lane_available),
 
   # Backup
   PythonProcess("backup_manager", "openpilot.sunnypilot.sunnylink.backups.manager", and_(only_offroad, sunnylink_ready_shim)),
