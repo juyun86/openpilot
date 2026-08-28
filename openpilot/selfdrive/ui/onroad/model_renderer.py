@@ -12,6 +12,7 @@ from openpilot.sunnypilot.selfdrive.radar_lane.display import (
   format_target_label,
   rendered_radar_track_ids,
   select_lane_display_targets,
+  should_render_second_lead,
 )
 from openpilot.system.ui.lib.application import FontWeight, gui_app
 from openpilot.system.ui.lib.shader_polygon import draw_polygon, Gradient
@@ -72,6 +73,7 @@ class ModelRenderer(Widget, ChevronMetrics, ModelRendererSP):
     self._lane_line_probs = np.zeros(4, dtype=np.float32)
     self._road_edge_stds = np.zeros(2, dtype=np.float32)
     self._lead_vehicles = [LeadVehicle(), LeadVehicle()]
+    self._lead_two_visible = False
     self._radar_lane_markers: list[RadarLaneMarker] = []
     self._radar_lane_font = gui_app.font(FontWeight.SEMI_BOLD)
     self._path_offset_z = HEIGHT_INIT[0]
@@ -180,7 +182,10 @@ class ModelRenderer(Widget, ChevronMetrics, ModelRendererSP):
   def _update_leads(self, radar_state, path_x_array):
     """Update positions of lead vehicles"""
     self._lead_vehicles = [LeadVehicle(), LeadVehicle()]
-    leads = [radar_state.leadOne, radar_state.leadTwo]
+    self._lead_two_visible = should_render_second_lead(
+      radar_state.leadOne, radar_state.leadTwo, self._lead_two_visible,
+    )
+    leads = [radar_state.leadOne, radar_state.leadTwo if self._lead_two_visible else None]
 
     for i, lead_data in enumerate(leads):
       if lead_data and lead_data.present:
@@ -198,7 +203,7 @@ class ModelRenderer(Widget, ChevronMetrics, ModelRendererSP):
     if radar_lane_state is None or not radar_lane_state.radarFresh or not radar_lane_state.modelFresh:
       return
 
-    drawn_track_ids = rendered_radar_track_ids(drawn_radar_state)
+    drawn_track_ids = rendered_radar_track_ids(drawn_radar_state, include_lead_two=self._lead_two_visible)
 
     for target in select_lane_display_targets(radar_lane_state.targets):
       d_rel = float(target.dRel)

@@ -56,3 +56,7 @@ priority over the closest target. Each marker shows distance and estimated
 longitudinal target speed (`vEgo + vRel`); this is a radar-relative estimate,
 not a wheel-speed measurement from the other vehicle. Red marks a cut-in
 candidate, orange a closing target, and green a non-closing target.
+The legacy `leadOne`/`leadTwo` chevrons are also display-deduplicated: the same
+radar track is never drawn twice, while leads without a stable common track use
+3 m hide / 5 m show longitudinal hysteresis when laterally close. This changes
+only rendering and does not remove either lead from `radarState` or control.

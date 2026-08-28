@@ -4,6 +4,7 @@ from openpilot.sunnypilot.selfdrive.radar_lane.display import (
   format_target_label,
   rendered_radar_track_ids,
   select_lane_display_targets,
+  should_render_second_lead,
 )
 
 
@@ -47,8 +48,29 @@ def test_target_label_reports_distance_and_estimated_absolute_speed():
 def test_existing_radar_chevrons_are_not_drawn_twice():
   radar_state = namespace(
     leadOne=namespace(present=True, radar=True, radarTrackId=7),
-    leadTwo=namespace(present=True, radar=False, radarTrackId=8),
+    leadTwo=namespace(present=True, radar=True, radarTrackId=8),
   )
 
-  assert rendered_radar_track_ids(radar_state) == frozenset({7})
+  assert rendered_radar_track_ids(radar_state) == frozenset({7, 8})
+  assert rendered_radar_track_ids(radar_state, include_lead_two=False) == frozenset({7})
   assert rendered_radar_track_ids(None) == frozenset()
+
+
+def _lead(*, present=True, radar=True, track_id=-1, d_rel=20.0, y_rel=0.0):
+  return namespace(present=present, radar=radar, radarTrackId=track_id, dRel=d_rel, yRel=y_rel)
+
+
+def test_second_lead_with_same_radar_track_is_always_suppressed():
+  assert not should_render_second_lead(_lead(track_id=4), _lead(track_id=4, d_rel=30.0), True)
+
+
+def test_second_lead_uses_distance_hysteresis_for_unstable_association():
+  lead_one = _lead(radar=False, d_rel=20.0)
+  assert not should_render_second_lead(lead_one, _lead(radar=False, d_rel=24.0), False)
+  assert should_render_second_lead(lead_one, _lead(radar=False, d_rel=24.0), True)
+  assert should_render_second_lead(lead_one, _lead(radar=False, d_rel=26.0), False)
+  assert not should_render_second_lead(lead_one, _lead(radar=False, d_rel=22.0), True)
+
+
+def test_laterally_separate_second_lead_is_preserved():
+  assert should_render_second_lead(_lead(d_rel=20.0, y_rel=-1.0), _lead(d_rel=20.0, y_rel=1.0), False)
