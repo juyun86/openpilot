@@ -1,8 +1,9 @@
 # Radar lane occupancy
 
 `radarlanesd` publishes the read-only `radarLaneStateSP` service from
-`modelV2` lane geometry and `radarTracks` points. It reports the closest
-forward radar target in the left-adjacent, current, and right-adjacent lane.
+`modelV2` lane geometry and `radarTracks` points. It reports occupancy and the
+closest forward radar target in the left-adjacent, current, and right-adjacent
+lane, plus a bounded global list of unique targets.
 Navigation route data is intentionally not an input: it describes route intent,
 not the live lane boundaries around the car.
 
@@ -16,6 +17,22 @@ consumed by longitudinal planning, FCW, lane-change control, or vehicle CAN.
 - `clear`: trustworthy model lane boundaries cover the reported distance and
   the current accepted front-radar tracks contain no target in that corridor.
 - `unknown`: the geometry or radar data cannot prove the corridor is clear.
+
+All accepted targets participate in occupancy and cut-in-candidate selection.
+The message publishes up to 24 unique target details in `targets`; `laneMask`
+identifies left/center/right membership and boundary targets can set two bits.
+`uniqueTargetCount` remains the full count, while `targetsTruncated` explicitly
+reports that the bounded list omitted lower-priority details. Predicted cut-in
+candidates are prioritized before distance, so a farther overtaking target is
+not hidden by a closer target in the same lane.
+
+Cut-in motion is estimated from the change in path-relative `dPath` across two
+fresh radar timestamps. Repeated model ticks do not reapply the same radar
+sample. `yvRel` is exposed only as raw diagnostic data because its ARS408 sign
+has not yet been validated for this installation; it is not used to decide
+cut-in direction. `cutInCandidate` means a measured lateral trend would reach
+the center-lane boundary within the published three-second horizon. It is a
+read-only candidate, not a collision decision or control command.
 
 When an outer lane line is unavailable, the classifier can still report
 positive evidence inside a nominal 3.6 m path-relative corridor. Absence in an

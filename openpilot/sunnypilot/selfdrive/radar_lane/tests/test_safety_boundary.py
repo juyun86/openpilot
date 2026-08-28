@@ -14,6 +14,8 @@ def test_custom_event_keeps_reserved_slot_and_logged_service():
   services = _read("openpilot/cereal/services.py")
 
   assert "struct RadarLaneStateSP @0xc2243c65e0340384" in custom_schema
+  assert "targets @13 :List(Target)" in custom_schema
+  assert "cutInCandidate @15 :Target" in custom_schema
   assert "radarLaneStateSP @137 :Custom.RadarLaneStateSP" in event_schema
   assert '"radarLaneStateSP": (True, 20., 5)' in services
 

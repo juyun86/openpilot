@@ -18,6 +18,11 @@ MIN_LANE_LINE_RANGE_M = 10.0
 LANE_LINE_START_TOLERANCE_M = 0.05
 LANE_BOUNDARY_AMBIGUITY_M = 0.30
 
+LANE_LEFT_MASK = 1
+LANE_CENTER_MASK = 2
+LANE_RIGHT_MASK = 4
+LANE_MASKS = {"left": LANE_LEFT_MASK, "center": LANE_CENTER_MASK, "right": LANE_RIGHT_MASK}
+
 
 class Occupancy(str, Enum):
   unknown = "unknown"
@@ -38,12 +43,16 @@ class RadarTarget:
   y_rel: float
   v_rel: float
   measured: bool = True
+  yv_rel: float = 0.0
+  yv_rel_valid: bool = False
 
 
 @dataclass(frozen=True)
 class ClassifiedTarget(RadarTarget):
   d_path: float = 0.0
   ambiguous: bool = False
+  lane_mask: int = 0
+  center_boundary_distance: float = -1.0
 
 
 @dataclass(frozen=True)
@@ -271,13 +280,20 @@ def radar_target_from_point(point: Any) -> RadarTarget | None:
     return None
 
   measured = True
+  yv_rel = 0.0
+  yv_rel_valid = False
   deprecated = getattr(point, "deprecated", None)
   if deprecated is not None:
     try:
       measured = bool(deprecated.measured)
     except (AttributeError, TypeError):
       pass
-  return RadarTarget(track_id, d_rel, y_rel, v_rel, measured)
+    try:
+      yv_rel = float(deprecated.yvRel)
+      yv_rel_valid = math.isfinite(yv_rel)
+    except (AttributeError, TypeError, ValueError):
+      pass
+  return RadarTarget(track_id, d_rel, y_rel, v_rel, measured, yv_rel if yv_rel_valid else 0.0, yv_rel_valid)
 
 
 def classify_radar_lanes(model: Any, targets: Iterable[RadarTarget],
@@ -297,7 +313,7 @@ def classify_radar_lanes(model: Any, targets: Iterable[RadarTarget],
     if projection is None:
       continue
 
-    matches: list[tuple[str, float]] = []
+    matches: dict[str, tuple[float, float, float, float]] = {}
     for name, geometry in geometries.items():
       if target.d_rel > geometry.evaluated_distance:
         continue
@@ -308,14 +324,38 @@ def classify_radar_lanes(model: Any, targets: Iterable[RadarTarget],
       lower, upper = bounds
       if lower - LANE_BOUNDARY_AMBIGUITY_M <= value <= upper + LANE_BOUNDARY_AMBIGUITY_M:
         boundary_distance = min(abs(value - lower), abs(value - upper))
-        matches.append((name, boundary_distance))
+        matches[name] = (boundary_distance, value, lower, upper)
 
-    ambiguous = len(matches) > 1 or any(distance <= LANE_BOUNDARY_AMBIGUITY_M for _, distance in matches)
-    for name, _ in matches:
-      classified[name].append(ClassifiedTarget(
-        target.track_id, target.d_rel, target.y_rel, target.v_rel, target.measured,
-        projection.d_path, ambiguous,
-      ))
+    ambiguous = len(matches) > 1 or any(
+      distance <= LANE_BOUNDARY_AMBIGUITY_M for distance, _, _, _ in matches.values()
+    )
+    lane_mask = sum(LANE_MASKS[name] for name in matches)
+    center_boundary_distances = []
+    if "left" in matches:
+      _, value, lower, _ = matches["left"]
+      center_boundary_distances.append(max(0.0, value - lower))
+    if "right" in matches:
+      _, value, _, upper = matches["right"]
+      center_boundary_distances.append(max(0.0, upper - value))
+    center_boundary_distance = min(center_boundary_distances, default=-1.0)
+    if lane_mask & LANE_CENTER_MASK and lane_mask & (LANE_LEFT_MASK | LANE_RIGHT_MASK):
+      center_boundary_distance = 0.0
+
+    classified_target = ClassifiedTarget(
+      track_id=target.track_id,
+      d_rel=target.d_rel,
+      y_rel=target.y_rel,
+      v_rel=target.v_rel,
+      measured=target.measured,
+      yv_rel=target.yv_rel,
+      yv_rel_valid=target.yv_rel_valid,
+      d_path=projection.d_path,
+      ambiguous=ambiguous,
+      lane_mask=lane_mask,
+      center_boundary_distance=center_boundary_distance,
+    )
+    for name in matches:
+      classified[name].append(classified_target)
 
   lane_results = {}
   for name, geometry in geometries.items():

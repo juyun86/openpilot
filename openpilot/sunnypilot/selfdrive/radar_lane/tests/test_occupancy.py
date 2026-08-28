@@ -3,6 +3,8 @@ from types import SimpleNamespace as namespace
 
 from openpilot.sunnypilot.selfdrive.radar_lane.occupancy import (
   GeometrySource,
+  LANE_CENTER_MASK,
+  LANE_LEFT_MASK,
   Occupancy,
   RadarTarget,
   classify_radar_lanes,
@@ -137,6 +139,8 @@ def test_boundary_target_conservatively_occupies_both_adjacent_lanes():
   assert result.center.targets[0].track_id == 9
   assert result.left.targets[0].ambiguous
   assert result.center.targets[0].ambiguous
+  assert result.left.targets[0].lane_mask == LANE_LEFT_MASK | LANE_CENTER_MASK
+  assert result.left.targets[0].center_boundary_distance == 0.0
 
 
 def test_closest_target_is_first_and_track_zero_is_valid():
@@ -177,13 +181,15 @@ def test_radar_point_adapter_preserves_unmeasured_track_and_id_zero():
     dRel=8.0,
     yRel=1.0,
     vRel=-0.5,
-    deprecated=namespace(measured=False),
+    deprecated=namespace(measured=False, yvRel=0.75),
   )
   target = radar_target_from_point(point)
 
   assert target is not None
   assert target.track_id == 0
   assert not target.measured
+  assert target.yv_rel_valid
+  assert target.yv_rel == 0.75
 
 
 if __name__ == "__main__":

@@ -611,6 +611,13 @@ struct RadarLaneStateSP @0xc2243c65e0340384 {
   leftAhead @7 :Lane;
   centerAhead @8 :Lane;
   rightAhead @9 :Lane;
+  uniqueTargetCount @10 :UInt16;
+  publishedTargetLimit @11 :UInt8;
+  targetsTruncated @12 :Bool;
+  targets @13 :List(Target);  # unique targets, risk-prioritized then distance-sorted
+  cutInCandidateCount @14 :UInt16;
+  cutInCandidate @15 :Target;  # earliest predicted center-lane crossing candidate
+  predictionHorizon @16 :Float32;  # s
 
   struct Lane {
     occupancy @0 :Occupancy;
@@ -630,6 +637,14 @@ struct RadarLaneStateSP @0xc2243c65e0340384 {
     dPath @5 :Float32;
     ambiguous @6 :Bool;  # target lies close to a shared lane boundary
     measured @7 :Bool;
+    yvRel @8 :Float32;  # raw RadarData lateral velocity; not used for cut-in prediction
+    yvRelValid @9 :Bool;
+    laneMask @10 :UInt8;  # bit 0 left, bit 1 center, bit 2 right
+    lateralSpeed @11 :Float32;  # m/s relative to model path, left positive
+    lateralSpeedValid @12 :Bool;
+    predictedDPath @13 :Float32;
+    timeToLaneCross @14 :Float32;  # s; -1 when unavailable
+    cutInCandidate @15 :Bool;
   }
 
   enum Occupancy {
