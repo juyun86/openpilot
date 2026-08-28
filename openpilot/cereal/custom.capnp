@@ -599,7 +599,50 @@ struct TrafficRadarState @0xcb9fd56c7057593a {
   stopSafetyAllowed @32 :Bool;  # All STOP gates except raw CAN freshness.
 }
 
-struct CustomReserved11 @0xc2243c65e0340384 {
+struct RadarLaneStateSP @0xc2243c65e0340384 {
+  modelMonoTime @0 :UInt64;
+  radarMonoTime @1 :UInt64;
+  radarAgeMs @2 :Float32;
+  radarFresh @3 :Bool;  # input is alive, valid, and no more than 150 ms behind
+  modelFresh @4 :Bool;  # input is alive, valid, and no more than 150 ms behind
+  forwardMinDistance @5 :Float32;  # m; only forward radar coverage is evaluated
+  forwardMaxDistance @6 :Float32;  # m; not a rear/side blind-spot guarantee
+
+  leftAhead @7 :Lane;
+  centerAhead @8 :Lane;
+  rightAhead @9 :Lane;
+
+  struct Lane {
+    occupancy @0 :Occupancy;
+    geometrySource @1 :GeometrySource;
+    geometryConfidence @2 :Float32;
+    evaluatedDistance @3 :Float32;
+    targetCount @4 :UInt16;
+    closestTarget @5 :Target;
+  }
+
+  struct Target {
+    present @0 :Bool;
+    trackId @1 :UInt64;
+    dRel @2 :Float32;
+    yRel @3 :Float32;
+    vRel @4 :Float32;
+    dPath @5 :Float32;
+    ambiguous @6 :Bool;  # target lies close to a shared lane boundary
+    measured @7 :Bool;
+  }
+
+  enum Occupancy {
+    unknown @0;
+    clear @1;
+    occupied @2;
+  }
+
+  enum GeometrySource {
+    none @0;
+    laneLines @1;
+    modelPathEstimate @2;
+  }
 }
 
 struct CustomReserved12 @0x9ccdc8676701b412 {
