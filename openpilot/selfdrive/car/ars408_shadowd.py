@@ -148,6 +148,7 @@ class ARS408ShadowWorker:
     self._last_diagnostics_host_ns: int | None = None
     self._pending_failure_bits = 0
     self._source_fence_ns = 0
+    self.gate_suspended = False
 
   def _publish_core(self, perception_state: ARS408PerceptionState, *, require_barrier: bool = False) -> PublishResult:
     host_now_ns = self.clock()
@@ -314,6 +315,19 @@ class ARS408ShadowWorker:
     """Best effort only; future consumers must still enforce local TTL."""
     return self.try_barrier(self.fault())
 
+  def suspend_for_gate_loss(self) -> bool:
+    """Latch one process-lifetime gate transition without discarding audit state."""
+    if self.gate_suspended:
+      return False
+    self.gate_suspended = True
+    self.try_teardown_barrier()
+    return True
+
+  def resume_from_gate(self) -> bool:
+    was_suspended = self.gate_suspended
+    self.gate_suspended = False
+    return was_suspended
+
   def mark_drain_complete(self) -> None:
     if self.barrier_pending:
       raise RuntimeError("cannot complete ARS408 drain before its barrier")
@@ -327,12 +341,17 @@ def _safe_log_exception(message: str) -> None:
     pass
 
 
-def _teardown_worker(worker: ARS408ShadowWorker | None) -> None:
-  """Best effort only; process loss still requires consumer-side TTL."""
+def _suspend_worker(worker: ARS408ShadowWorker | None) -> None:
+  """Best effort once per valid-to-invalid gate transition."""
   if worker is None:
     return
   try:
-    worker.try_teardown_barrier()
+    if not worker.gate_suspended:
+      worker.suspend_for_gate_loss()
+    elif worker.barrier_pending:
+      # A rate-limited edge barrier may be retried while disabled, but the
+      # already-latched transition must not hard-reset or rotate its epoch.
+      worker.try_barrier()
   except Exception:
     pass
 
@@ -362,8 +381,7 @@ def main() -> None:
         fault_count += 1
         continue
     if read_live_ars408_config(params) is None:
-      _teardown_worker(worker)
-      worker = None
+      _suspend_worker(worker)
       if can_sock is not None:
         try:
           messaging.drain_sock_raw(can_sock)
@@ -374,8 +392,7 @@ def main() -> None:
     if REPLAY:
       # Source/replay transport has no proven cross-socket watermark. Do not
       # subscribe or publish until a non-disruptive transport fence is proven.
-      _teardown_worker(worker)
-      worker = None
+      _suspend_worker(worker)
       time.sleep(IDLE_RECHECK_S)
       continue
     if worker is None:
@@ -404,6 +421,9 @@ def main() -> None:
         time.sleep(min(1.0, FAULT_BACKOFF_S * fault_count))
         continue
 
+    if worker.gate_suspended:
+      worker.resume_from_gate()
+
     try:
       if worker.barrier_pending or worker.drain_required:
         if worker.barrier_pending and not worker.try_barrier():
@@ -421,8 +441,7 @@ def main() -> None:
         continue
       raw_events = messaging.drain_sock_raw(can_sock, wait_for_one=True)
       if read_live_ars408_config(params) is None:
-        _teardown_worker(worker)
-        worker = None
+        _suspend_worker(worker)
         continue
       batch_result = worker.handle_batch(raw_events)
       fault_count = _next_fault_count(fault_count, batch_result)

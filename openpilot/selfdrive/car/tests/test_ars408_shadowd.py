@@ -30,6 +30,11 @@ from opendbc.can import CANPacker
 from opendbc.sunnypilot.car.tesla.ars408.constants import ARS408_BUS
 from opendbc.sunnypilot.car.tesla.values import TeslaFlagsSP, TeslaSafetyFlagsSP
 from openpilot.cereal import custom, log
+from openpilot.selfdrive.car.tests.test_ars408_state import (
+  perception_state as diagnostic_perception_state,
+  snapshot as diagnostic_snapshot,
+  target as diagnostic_target,
+)
 
 if not MSGQ_AVAILABLE:
   fake_messaging = types.ModuleType("openpilot.cereal.messaging")
@@ -576,6 +581,89 @@ def test_fault_evidence_survives_rate_limited_barrier_diagnostics_until_logged(m
   assert current._pending_failure_bits == 0
 
 
+def test_gate_suspend_preserves_process_lifetime_limits_pending_evidence_and_recovery_fence(monkeypatch) -> None:
+  clock = MutableClock(1_000_000_000)
+  sent_at = []
+  pm = StubPubMaster(on_send=lambda service: sent_at.append((service, clock())))
+  current = worker(pm, clock=clock)
+  assert current.try_barrier()
+  current.mark_drain_complete()
+  initial_fault_count = current.pipeline.producer_fault_count
+  observed_epoch = current.pipeline.producer_epoch
+  target_reason = 1 << 11
+  old_target = diagnostic_target(77, lifecycle="tentative", reason_bits=target_reason)
+  old_state = diagnostic_perception_state(
+    diagnostic_snapshot(sequence=77, source_ns=clock(), uncertain=(old_target,)),
+    producer_epoch=observed_epoch, shadow_now_source_ns=clock(),
+  )
+  assert current._publish_diagnostics(old_state) == daemon.PublishResult.INTENTIONALLY_SUPPRESSED
+  assert (observed_epoch, 77) in current.publisher._diagnostic_accumulator
+  assert current.publisher._window_reason_bits & target_reason
+
+  clock.advance(1_000_000)
+  assert current.suspend_for_gate_loss()
+  suspended_epoch = current.pipeline.producer_epoch
+  assert current.gate_suspended and current.barrier_pending
+  assert current.pipeline.producer_fault_count == initial_fault_count + 1
+  assert current._pending_failure_bits & daemon.SHADOW_TRANSIENT_PRODUCER_FAILED
+
+  for _ in range(25):
+    assert not current.suspend_for_gate_loss()
+    assert not current.try_barrier()
+    assert current.pipeline.producer_epoch == suspended_epoch
+  assert current.pipeline.producer_fault_count == initial_fault_count + 1
+
+  assert current.resume_from_gate()
+  clock.advance(daemon.CORE_BARRIER_MIN_INTERVAL_NS - 1_000_000)
+  assert current.try_barrier()
+  assert current.pipeline.producer_epoch == suspended_epoch
+  core_times = [timestamp for service, timestamp in sent_at if service == "ars408StateSP"]
+  assert core_times[-1] - core_times[-2] >= daemon.CORE_BARRIER_MIN_INTERVAL_NS
+  assert current.last_diagnostics_result == daemon.PublishResult.INTENTIONALLY_SUPPRESSED
+  assert current._pending_failure_bits & daemon.SHADOW_TRANSIENT_PRODUCER_FAILED
+  assert (observed_epoch, 77) in current.publisher._diagnostic_accumulator
+  assert current.publisher._window_reason_bits & target_reason
+
+  # A successful barrier still requires the recovery drain before any batch.
+  assert current.handle_batch([b"must-be-drained"]) == daemon.BatchResult.FAULTED
+  current.mark_drain_complete()
+  recovered = replace(current.pipeline.state(clock()), producer_fault=False, transient_failure_bits=0)
+  monkeypatch.setattr(daemon, "can_capnp_to_list", lambda _raw: [(clock(), [(0, b"", 1)])])
+  monkeypatch.setattr(current.pipeline, "process_batch", lambda *_args, **_kwargs: recovered)
+
+  # Before the old evidence can be logged, diagnostics is suppressed and the
+  # following core must remain invalid rather than exposing a healthy gap.
+  clock.advance(daemon.CORE_BARRIER_MIN_INTERVAL_NS)
+  assert current.handle_batch([b"pre-diagnostics"]) == daemon.BatchResult.HEALTHY
+  assert current.last_diagnostics_result == daemon.PublishResult.INTENTIONALLY_SUPPRESSED
+  assert not [event for service, event in pm.sent if service == "ars408StateSP"][-1].valid
+  assert current._pending_failure_bits & daemon.SHADOW_TRANSIENT_PRODUCER_FAILED
+  assert (observed_epoch, 77) in current.publisher._diagnostic_accumulator
+  assert current.publisher._window_reason_bits & target_reason
+
+  clock.advance(500_000_000 - 2 * daemon.CORE_BARRIER_MIN_INTERVAL_NS + 1)
+  pm.fail_service = "ars408DiagnosticsSP"
+  assert current.handle_batch([b"failed-diagnostics"]) == daemon.BatchResult.FAULTED
+  assert current.barrier_pending
+  assert (observed_epoch, 77) in current.publisher._diagnostic_accumulator
+  assert current.publisher._window_reason_bits & target_reason
+  assert current._pending_failure_bits & daemon.SHADOW_TRANSIENT_PRODUCER_FAILED
+
+  pm.fail_service = None
+  assert current.try_barrier()
+  diagnostic_times = [timestamp for service, timestamp in sent_at if service == "ars408DiagnosticsSP"]
+  assert diagnostic_times[-1] - diagnostic_times[-2] >= daemon.DIAGNOSTICS_MIN_INTERVAL_NS
+  logged = [event for service, event in pm.sent if service == "ars408DiagnosticsSP"][-1]
+  assert logged.ars408DiagnosticsSP.transientFailureBits & daemon.SHADOW_TRANSIENT_PRODUCER_FAILED
+  assert logged.ars408DiagnosticsSP.producerFailed
+  audit_target = next(item for item in logged.ars408DiagnosticsSP.targets if item.target.logicalId == 77)
+  assert audit_target.observedProducerEpoch == observed_epoch
+  assert logged.ars408DiagnosticsSP.windowReasonBits & target_reason
+  assert current._pending_failure_bits == 0
+  assert not current.publisher._diagnostic_accumulator
+  assert not (current.publisher._window_reason_bits & target_reason)
+
+
 def test_epoch_churn_cannot_exceed_physical_core_or_diagnostics_ceilings() -> None:
   pm = StubPubMaster()
   clock = MutableClock(1_000_000_000)
@@ -729,7 +817,7 @@ def test_main_reuses_one_socket_across_twenty_five_real_gate_cycles(monkeypatch)
     pass
 
   gate_values = iter([value for _ in range(25) for value in (True, False, False)])
-  counts = {"pubmaster": 0, "socket": 0, "worker": 0, "teardown": 0, "drain": 0}
+  counts = {"pubmaster": 0, "socket": 0, "worker": 0, "teardown": 0, "resume": 0, "drain": 0}
 
   def gate(_params):
     try:
@@ -742,6 +830,7 @@ def test_main_reuses_one_socket_across_twenty_five_real_gate_cycles(monkeypatch)
       counts["worker"] += 1
       self.barrier_pending = True
       self.drain_required = False
+      self.gate_suspended = False
 
     def try_barrier(self):
       self.barrier_pending = False
@@ -751,8 +840,18 @@ def test_main_reuses_one_socket_across_twenty_five_real_gate_cycles(monkeypatch)
     def mark_drain_complete(self):
       self.drain_required = False
 
-    def try_teardown_barrier(self):
+    def suspend_for_gate_loss(self):
+      if self.gate_suspended:
+        return False
+      self.gate_suspended = True
       counts["teardown"] += 1
+      self.barrier_pending = False
+      self.drain_required = True
+      return True
+
+    def resume_from_gate(self):
+      self.gate_suspended = False
+      counts["resume"] += 1
       return True
 
   def pubmaster(_services):
@@ -782,7 +881,7 @@ def test_main_reuses_one_socket_across_twenty_five_real_gate_cycles(monkeypatch)
 
   with pytest.raises(StopMain):
     daemon.main()
-  assert counts == {"pubmaster": 1, "socket": 1, "worker": 25, "teardown": 25, "drain": 75}
+  assert counts == {"pubmaster": 1, "socket": 1, "worker": 1, "teardown": 25, "resume": 24, "drain": 75}
 
   source = Path(daemon.__file__).read_text(encoding="utf-8")
   main_tree = ast.parse(source)
@@ -803,21 +902,31 @@ def test_daemon_can_socket_is_explicitly_non_conflated() -> None:
   assert isinstance(conflate.value, ast.Constant) and conflate.value.value is False
 
 
-def test_both_gate_loss_paths_use_the_same_best_effort_teardown() -> None:
+def test_both_gate_loss_paths_use_the_same_process_lifetime_suspend_state() -> None:
   source = Path(daemon.__file__).read_text(encoding="utf-8")
   tree = ast.parse(source)
   main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
   teardown_calls = [node for node in ast.walk(main) if isinstance(node, ast.Call) and
-                    isinstance(node.func, ast.Name) and node.func.id == "_teardown_worker"]
+                    isinstance(node.func, ast.Name) and node.func.id == "_suspend_worker"]
   # Top-of-loop gate loss, disabled REPLAY transport, and post-read gate loss.
   assert len(teardown_calls) == 3
 
   calls = []
-  stub = SimpleNamespace(try_teardown_barrier=lambda: calls.append("barrier") or True)
-  daemon._teardown_worker(stub)
-  assert calls == ["barrier"]
-  daemon._teardown_worker(SimpleNamespace(
-    try_teardown_barrier=lambda: (_ for _ in ()).throw(RuntimeError("send failed")),
+  stub = SimpleNamespace(gate_suspended=False, barrier_pending=False,
+                         suspend_for_gate_loss=lambda: calls.append("suspend") or True)
+  daemon._suspend_worker(stub)
+  assert calls == ["suspend"]
+  stub.gate_suspended = True
+  stub.barrier_pending = True
+  stub.try_barrier = lambda: calls.append("retry") or False
+  daemon._suspend_worker(stub)
+  assert calls == ["suspend", "retry"]
+  stub.barrier_pending = False
+  daemon._suspend_worker(stub)
+  assert calls == ["suspend", "retry"]
+  daemon._suspend_worker(SimpleNamespace(
+    gate_suspended=False, barrier_pending=False,
+    suspend_for_gate_loss=lambda: (_ for _ in ()).throw(RuntimeError("send failed")),
   ))
 
 
