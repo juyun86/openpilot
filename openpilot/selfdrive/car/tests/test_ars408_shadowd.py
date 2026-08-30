@@ -693,6 +693,22 @@ def test_observational_daemon_does_not_auto_restart_and_consume_msgq_reader_slot
   restart = [keyword for keyword in processes[0].keywords if keyword.arg == "restart_if_crash"]
   assert restart == []
 
+  process_source = (root / "openpilot/system/manager/process.py").read_text(encoding="utf-8")
+  process_tree = ast.parse(process_source)
+  python_class = next(node for node in process_tree.body if isinstance(node, ast.ClassDef) and node.name == "PythonProcess")
+  python_init = next(node for node in python_class.body if isinstance(node, ast.FunctionDef) and node.name == "__init__")
+  restart_args = [index for index, arg in enumerate(python_init.args.args) if arg.arg == "restart_if_crash"]
+  if restart_args:
+    default_offset = len(python_init.args.args) - len(python_init.args.defaults)
+    restart_default = python_init.args.defaults[restart_args[0] - default_offset]
+    assert isinstance(restart_default, ast.Constant) and restart_default.value is False
+  else:
+    start = next(node for node in python_class.body if isinstance(node, ast.FunctionDef) and node.name == "start")
+    assert any(isinstance(node, ast.If) and isinstance(node.test, ast.Compare) and
+               isinstance(node.test.left, ast.Attribute) and node.test.left.attr == "proc" and
+               any(isinstance(op, ast.IsNot) for op in node.test.ops) and
+               any(isinstance(item, ast.Return) for item in node.body) for node in ast.walk(start))
+
 
 def test_twenty_five_gate_toggles_reuse_one_process_lifetime_can_socket() -> None:
   calls = []
@@ -706,6 +722,75 @@ def test_twenty_five_gate_toggles_reuse_one_process_lifetime_can_socket() -> Non
     socket = daemon._get_or_create_can_socket(socket, factory)
   assert len(calls) == 1
   assert calls[0] == (("can",), {"timeout": 100, "conflate": False})
+
+
+def test_main_reuses_one_socket_across_twenty_five_real_gate_cycles(monkeypatch) -> None:
+  class StopMain(Exception):
+    pass
+
+  gate_values = iter([value for _ in range(25) for value in (True, False, False)])
+  counts = {"pubmaster": 0, "socket": 0, "worker": 0, "teardown": 0, "drain": 0}
+
+  def gate(_params):
+    try:
+      return object() if next(gate_values) else None
+    except StopIteration as exc:
+      raise StopMain from exc
+
+  class MainWorker:
+    def __init__(self, _pm):
+      counts["worker"] += 1
+      self.barrier_pending = True
+      self.drain_required = False
+
+    def try_barrier(self):
+      self.barrier_pending = False
+      self.drain_required = True
+      return True
+
+    def mark_drain_complete(self):
+      self.drain_required = False
+
+    def try_teardown_barrier(self):
+      counts["teardown"] += 1
+      return True
+
+  def pubmaster(_services):
+    counts["pubmaster"] += 1
+    return object()
+
+  socket = object()
+
+  def socket_factory(current):
+    assert current is None
+    counts["socket"] += 1
+    return socket
+
+  def drain(current, **_kwargs):
+    assert current is socket
+    counts["drain"] += 1
+    return [b"raw"]
+
+  monkeypatch.setattr(daemon, "Params", lambda: object())
+  monkeypatch.setattr(daemon.messaging, "PubMaster", pubmaster)
+  monkeypatch.setattr(daemon, "read_live_ars408_config", gate)
+  monkeypatch.setattr(daemon, "_get_or_create_can_socket", socket_factory)
+  monkeypatch.setattr(daemon, "ARS408ShadowWorker", MainWorker)
+  monkeypatch.setattr(daemon.messaging, "drain_sock_raw", drain)
+  monkeypatch.setattr(daemon.time, "sleep", lambda _seconds: None)
+  monkeypatch.setattr(daemon, "REPLAY", False)
+
+  with pytest.raises(StopMain):
+    daemon.main()
+  assert counts == {"pubmaster": 1, "socket": 1, "worker": 25, "teardown": 25, "drain": 75}
+
+  source = Path(daemon.__file__).read_text(encoding="utf-8")
+  main_tree = ast.parse(source)
+  main = next(node for node in main_tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+  can_sock_none = [node for node in ast.walk(main) if isinstance(node, ast.Assign) and
+                   any(isinstance(target, ast.Name) and target.id == "can_sock" for target in node.targets) and
+                   isinstance(node.value, ast.Constant) and node.value.value is None]
+  assert len(can_sock_none) == 1
 
 
 def test_daemon_can_socket_is_explicitly_non_conflated() -> None:

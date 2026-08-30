@@ -159,7 +159,8 @@ procs = [
   PythonProcess("selfdrived", "openpilot.selfdrive.selfdrived.selfdrived", only_onroad),
   PythonProcess("card", "openpilot.selfdrive.car.card", only_onroad),
   # Do not auto-restart: msgq CAN reader slots are process-lifetime resources.
-  # A crash stays fail-closed/UNKNOWN until the normal process lifecycle resets it.
+  # A crash stays silent; only a future consumer's service TTL may interpret
+  # that silence as UNKNOWN. There is currently no consumer.
   # Long-lived so normal offroad/onroad transitions do not consume additional
   # process-lifetime msgq CAN reader slots. The daemon's internal live gate
   # controls whether it creates a socket and processes/publishes radar data.
