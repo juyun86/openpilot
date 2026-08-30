@@ -37,6 +37,11 @@ _services: dict[str, tuple] = {
   "radarState": (True, 20., 5),
   "narrowRoadEncodeIdx": (False, 20., 1),
   "radarTracks": (True, 20.),
+  "ars408StateSP": (False, 14.),
+  # Nominal 2 Hz diagnostics plus at most one immediate health/fault transition
+  # emission per nominal window: the declared 4 Hz ceiling is used for queues
+  # and worst-case logging budgets. Every physical event is logged (decimation 1).
+  "ars408DiagnosticsSP": (True, 4., 1),
   "sendcan": (True, 100., 139, QueueSize.MEDIUM),
   "logMessage": (True, 0., None, QueueSize.BIG),
   "errorLogMessage": (True, 0., 1, QueueSize.BIG),

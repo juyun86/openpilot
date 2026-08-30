@@ -158,6 +158,12 @@ procs = [
   PythonProcess("joystickd", "openpilot.tools.joystick.joystickd", or_(joystick, notcar)),
   PythonProcess("selfdrived", "openpilot.selfdrive.selfdrived.selfdrived", only_onroad),
   PythonProcess("card", "openpilot.selfdrive.car.card", only_onroad),
+  # Do not auto-restart: msgq CAN reader slots are process-lifetime resources.
+  # A crash stays fail-closed/UNKNOWN until the normal process lifecycle resets it.
+  # Long-lived so normal offroad/onroad transitions do not consume additional
+  # process-lifetime msgq CAN reader slots. The daemon's internal live gate
+  # controls whether it creates a socket and processes/publishes radar data.
+  PythonProcess("ars408shadowd", "openpilot.selfdrive.car.ars408_shadowd", always_run),
   PythonProcess("deleter", "openpilot.system.loggerd.deleter", always_run),
   PythonProcess("dmonitoringd", "openpilot.selfdrive.monitoring.dmonitoringd", visual_driver_monitoring, enabled=(WEBCAM or not PC)),
   PythonProcess("qcomgpsd", "openpilot.system.qcomgpsd.qcomgpsd", qcomgps, enabled=COMMA_HARDWARE),

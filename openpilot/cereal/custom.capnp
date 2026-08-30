@@ -602,10 +602,259 @@ struct TrafficRadarState @0xcb9fd56c7057593a {
 struct CustomReserved11 @0xc2243c65e0340384 {
 }
 
-struct CustomReserved12 @0x9ccdc8676701b412 {
+struct ARS408StateSP @0x9ccdc8676701b412 {
+  sequence @0 :UInt32;
+  measurementMonoTime @1 :UInt64;
+  measurementCounter @2 :UInt16;
+  cycleStatus @3 :CycleStatus;
+  motionInputValid @4 :Bool;
+  generalComplete @5 :Bool;
+  qualityComplete @6 :Bool;
+  extendedComplete @7 :Bool;
+  rawCount @8 :UInt16;
+  targets @9 :List(CompactTarget);
+  # Deprecated wire-compatibility slots. Full diagnostics moved to the
+  # independent ars408DiagnosticsSP service; producers must keep these empty.
+  diagnosticTargets @10 :List(DiagnosticTarget);
+  stableCount @11 :UInt16;
+  uncertainCount @12 :UInt16;
+  clutterCount @13 :UInt16;
+  expiredCount @14 :UInt16;
+  targetCount @15 :UInt16;
+  diagnosticCount @16 :UInt16;
+  targetsTruncated @17 :Bool;
+  diagnosticsTruncated @18 :Bool;
+  diagnosticsUpdated @19 :Bool;
+  diagnosticSequence @20 :UInt32;
+  schemaVersion @21 :UInt16;
+  health @22 :Health;
+  hasData @23 :Bool;
+  sourceFresh @24 :Bool;
+  sourceAgeMs @25 :UInt32;
+  radarStateReady @26 :Bool;
+  radarStateFresh @27 :Bool;
+  parserValid @28 :Bool;
+  producerFault @29 :Bool;
+  producerFaultCount @30 :UInt32;
+  errors @31 :Errors;
+  counterGap @32 :UInt16;
+  droppedCycleCount @33 :UInt32;
+  acceptedCount @34 :UInt16;
+  forwardPresenceState @35 :ForwardPresenceState;
+  lateralTransformValid @36 :Bool;
+  lastComponentMonoTime @37 :UInt64;
+  assemblyCloseMonoTime @38 :UInt64;
+  interferenceCount @39 :UInt32;
+  interferenceActive @40 :Bool;
+  cadenceValid @41 :Bool;
+  expectedCounterStep @42 :UInt16;
+  configObserved @43 :Bool;
+  configValid @44 :Bool;
+  counterAnomalyCount @45 :UInt32;
+  cadenceVerified @46 :Bool;
+  cadenceInferred @47 :Bool;
+  stepSource @48 :CadenceStepSource;
+  # Failures observed anywhere within this producer update, even if the final
+  # sampled RadarState recovered before publication.
+  transientFailureBits @49 :UInt32;
+  # Non-zero process-instance/hard-reset identity. Zero is unknown. sequence
+  # and logicalId are meaningful only together with this epoch. Any future
+  # consumer must independently enforce service liveness, local TTL, monotonic
+  # Event/source time, and discard state on epoch change; a teardown barrier is
+  # best-effort and cannot make a last valid socket message safe indefinitely.
+  producerEpoch @50 :UInt64;
+
+  enum CycleStatus {
+    invalid @0;
+    exact @1;
+    partial @2;
+    duplicate @3;
+    unavailable @4;
+  }
+
+  enum Lifecycle {
+    unavailable @0;
+    tentative @1;
+    confirmedFresh @2;
+    coasting @3;
+    clutterSuspect @4;
+    expired @5;
+  }
+
+  enum SemanticGroup {
+    unknownObstacle @0;
+    vehicle @1;
+    pedestrian @2;
+    rider @3;
+  }
+
+  enum Health {
+    unavailable @0;
+    healthy @1;
+    degraded @2;
+    stale @3;
+    producerFault @4;
+  }
+
+  # Presence-only fail-safe state. It never grants permission to proceed and
+  # must not be interpreted as lane use or a permissive road-edge/BSM signal.
+  enum ForwardPresenceState {
+    unknown @0;
+    present @1;
+  }
+
+  enum CadenceStepSource {
+    unknown @0;
+    external @1;
+    inferred @2;
+    deviceCapture @3;
+  }
+
+  enum DiagnosticKind {
+    unknown @0;
+    uncertain @1;
+    clutter @2;
+    expired @3;
+    stableAudit @4;
+  }
+
+  struct Errors {
+    canError @0 :Bool;
+    radarFault @1 :Bool;
+    radarUnavailableTemporary @2 :Bool;
+    wrongConfig @3 :Bool;
+  }
+
+  struct CompactTarget {
+    # dRel/yRel use metres (m); vRel uses m/s; lastMeasuredAgeMs uses ms.
+    logicalId @0 :UInt64;
+    rawId @1 :UInt16;
+    lifecycle @2 :Lifecycle;
+    semanticGroup @3 :SemanticGroup;
+    freshMeasured @4 :Bool;
+    possibleVru @5 :Bool;
+    dRel @6 :Float32;
+    yRel @7 :Float32;
+    vRel @8 :Float32;
+    lastMeasuredAgeMs @9 :Float32;
+    ageCycles @10 :UInt32;
+    existenceProbabilityCode @11 :UInt8;
+    measurementState @12 :UInt8;
+    dynamicProperty @13 :UInt8;
+    rawClass @14 :UInt8;
+    stableClass @15 :UInt8;
+    reasonBits @16 :UInt32;
+  }
+
+  struct DiagnosticTarget {
+    # Diagnostic units: rawDRel/rawYRel/length/width use metres (m);
+    # rawVRel/rawYvRel/yvRel use m/s; aRelLong/aRelLat use m/s²;
+    # orientation uses degrees; rcs uses dBm² (DBC spelling: dBm2).
+    # All lateral fields yRel/rawYRel/yvRel/rawYvRel/aRelLat/orientation have
+    # passed through the current sensor-to-openpilot sign transform, which
+    # remains unverified on the installed vehicle.
+    # observedProducerEpoch, observedSequence, and observedMonoTime identify
+    # the selected source observation, not the diagnostics publication header.
+    kind @0 :DiagnosticKind;
+    target @1 :CompactTarget;
+    extendedFresh @2 :Bool;
+    hitCount @3 :UInt32;
+    missCount @4 :UInt32;
+    rawDRel @5 :Float32;
+    rawYRel @6 :Float32;
+    rawVRel @7 :Float32;
+    rawYvRel @8 :Float32;
+    aRelLong @9 :Float32;
+    aRelLat @10 :Float32;
+    orientation @11 :Float32;
+    length @12 :Float32;
+    width @13 :Float32;
+    rcs @14 :Float32;
+    clutterScore @15 :Float32;
+    rmsCodes @16 :List(UInt8);
+    rmsUpperBounds @17 :List(Float32);
+    rmsValidMask @18 :UInt8;
+    yvRel @19 :Float32;
+    qualityScore @20 :Float32;
+    coordinateUnverified @21 :Bool;
+    observedSequence @22 :UInt32;
+    observedMonoTime @23 :UInt64;
+    observedProducerEpoch @24 :UInt64;
+  }
 }
 
-struct CustomReserved13 @0xcd96dafb67a082d0 {
+# Window audit contract: targets, fullCount, targetCount, and the four
+# *FullCount fields form a bounded incremental audit collection accumulated
+# since the previous physical ars408DiagnosticsSP event. Selection is
+# deduplicated by (observedProducerEpoch, logicalId): possible-VRU/class-conflict records have highest
+# safety priority, then expired, clutter, uncertain, and stableAudit; for the
+# same (observedProducerEpoch, logicalId) and priority, the newer observation replaces the older one.
+# rawCount and acceptedCount describe only the latest snapshot header; they are
+# not window totals. A targetCount of zero is not a current target-absence claim
+# and must never authorize free space, lane use, or motion.
+struct ARS408DiagnosticsSP @0xcd96dafb67a082d0 {
+  schemaVersion @0 :UInt16;
+  sequence @1 :UInt32;
+  measurementMonoTime @2 :UInt64;
+  health @3 :ARS408StateSP.Health;
+  hasData @4 :Bool;
+  sourceFresh @5 :Bool;
+  sourceAgeMs @6 :UInt32;
+  coordinateUnverified @7 :Bool;
+  fullCount @8 :UInt16;
+  targetCount @9 :UInt16;
+  truncated @10 :Bool;
+  targets @11 :List(ARS408StateSP.DiagnosticTarget);
+  lastComponentMonoTime @12 :UInt64;
+  assemblyCloseMonoTime @13 :UInt64;
+  parserValid @14 :Bool;
+  errors @15 :ARS408StateSP.Errors;
+  radarStateReady @16 :Bool;
+  radarStateFresh @17 :Bool;
+  configObserved @18 :Bool;
+  configValid @19 :Bool;
+  interferenceActive @20 :Bool;
+  interferenceCount @21 :UInt32;
+  motionInputValid @22 :Bool;
+  lateralTransformValid @23 :Bool;
+  producerFault @24 :Bool;
+  producerFaultCount @25 :UInt32;
+  cycleStatus @26 :ARS408StateSP.CycleStatus;
+  measurementCounter @27 :UInt16;
+  counterGap @28 :UInt16;
+  droppedCycleCount @29 :UInt32;
+  counterAnomalyCount @30 :UInt32;
+  cadenceValid @31 :Bool;
+  cadenceVerified @32 :Bool;
+  cadenceInferred @33 :Bool;
+  expectedCounterStep @34 :UInt16;
+  stepSource @35 :ARS408StateSP.CadenceStepSource;
+  generalComplete @36 :Bool;
+  qualityComplete @37 :Bool;
+  extendedComplete @38 :Bool;
+  rawCount @39 :UInt16;
+  acceptedCount @40 :UInt16;
+  stableFullCount @41 :UInt16;
+  uncertainFullCount @42 :UInt16;
+  clutterFullCount @43 :UInt16;
+  expiredFullCount @44 :UInt16;
+  windowStartMonoTime @45 :UInt64;
+  windowEndMonoTime @46 :UInt64;
+  windowReasonBits @47 :UInt32;
+  transitionCount @48 :UInt32;
+  worstHealth @49 :ARS408StateSP.Health;
+  sourceFailed @50 :Bool;
+  radarFailed @51 :Bool;
+  parserFailed @52 :Bool;
+  motionFailed @53 :Bool;
+  configFailed @54 :Bool;
+  interferenceFailed @55 :Bool;
+  cadenceFailed @56 :Bool;
+  counterFailed @57 :Bool;
+  producerFailed @58 :Bool;
+  transientFailureBits @59 :UInt32;
+  # Same identity contract as ARS408StateSP.producerEpoch.
+  producerEpoch @60 :UInt64;
 }
 
 struct CustomReserved14 @0xb057204d7deadf3f {
