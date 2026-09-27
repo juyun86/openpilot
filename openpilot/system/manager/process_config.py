@@ -6,7 +6,7 @@ from opendbc.car.structs import car
 from openpilot.cereal import custom
 from openpilot.common.params import Params
 from openpilot.common.hardware import PC, COMMA_HARDWARE
-from openpilot.system.manager.process import PythonProcess, NativeProcess, DaemonProcess
+from openpilot.system.manager.process import PythonProcess, RestartingPythonProcess, NativeProcess, DaemonProcess
 from openpilot.common.hardware.hw import Paths
 
 from openpilot.sunnypilot.mapd.mapd_manager import MAPD_PATH
@@ -77,8 +77,7 @@ def navassist_lane_observer_ready(started: bool, params: Params, CP: car.CarPara
   return started and CP.brand == "tesla" and navassist_receiver_ready(started, params, CP)
 
 def record_route_video(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return (get_hardware_profile() != HardwareProfile.C3XL and
-          started and params.get_bool("RecordRoadVideo"))
+  return started and params.get_bool("RecordRoadVideo")
 
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
@@ -207,7 +206,7 @@ procs = [
 procs += [
   # Optional C3XL integrations are isolated processes; disabling them restores
   # the upstream process graph and control behavior.
-  PythonProcess("device_console", "openpilot.selfdrive.debug.device_console", use_device_console),
+  RestartingPythonProcess("device_console", "openpilot.selfdrive.debug.device_console", use_device_console),
   PythonProcess("tesla_hotspotd", "openpilot.selfdrive.debug.tesla_hotspotd", use_c3xl_tesla_hotspot),
   PythonProcess("alert_output", "openpilot.sunnypilot.system.alert_output", use_external_buzzer),
   PythonProcess("chestnut_statusd", "openpilot.system.hardware.chestnut.statusd", only_offroad),

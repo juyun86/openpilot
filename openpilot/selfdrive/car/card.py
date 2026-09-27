@@ -21,12 +21,15 @@ from opendbc.car.interfaces import CarInterfaceBase, RadarInterfaceBase
 from openpilot.selfdrive.pandad import can_capnp_to_list, can_list_to_can_capnp
 from openpilot.selfdrive.car.cruise import VCruiseHelper
 from openpilot.selfdrive.car.helpers import convert_carControlSP, convert_to_capnp
+from openpilot.selfdrive.car.gateway_config_bridge import GatewayConfigBridge
+from openpilot.sunnypilot.hardware.profile import HardwareProfile, get_hardware_profile
 
 from openpilot.sunnypilot.mads.helpers import set_alternative_experience, set_car_specific_params
 from openpilot.sunnypilot.selfdrive.car import interfaces as sunnypilot_interfaces
 from openpilot.sunnypilot.selfdrive.car.tesla.card_adapter import CONTEXT_SERVICES, TeslaCardAdapter
 
 REPLAY = "REPLAY" in os.environ
+GATEWAY_CONFIG_BRIDGE_HEALTH_INTERVAL = 5.0
 
 EventName = log.OnroadEvent.EventName
 
@@ -190,6 +193,12 @@ class Car:
     # card is driven by can recv, expected at 100Hz
     self.rk = Ratekeeper(100, print_delay_threshold=None)
 
+    gateway_bridge_enabled = (self.CP.brand == "tesla" and not REPLAY and
+                              get_hardware_profile() == HardwareProfile.C3XL)
+    self.gateway_config_bridge = GatewayConfigBridge() if gateway_bridge_enabled else None
+    if self.gateway_config_bridge is not None and not self.gateway_config_bridge.start():
+      cloudlog.error("gateway config bridge worker unavailable; will retry")
+
     # log fingerprint in sentry
     sunnypilot_interfaces.log_fingerprint(self.CP)
 
@@ -198,6 +207,8 @@ class Car:
 
     can_strs = messaging.drain_sock_raw(self.can_sock, wait_for_one=True)
     can_list = can_capnp_to_list(can_strs)
+    if self.gateway_config_bridge is not None:
+      self.gateway_config_bridge.observe(can_list)
     urgent_sends = self.tesla_adapter.observe_can(can_list)
     if urgent_sends:
       self.can_callbacks[1](urgent_sends)
@@ -212,7 +223,7 @@ class Car:
     RD: structs.RadarDataT | None = self.RI.update(can_list)
 
     self.sm.update(0)
-    self.tesla_adapter.update_context()
+    self.tesla_adapter.update_context(radar_now_ns=can_list[0][0] if REPLAY and can_list else None, radar_data=RD)
 
     can_rcv_valid = len(can_strs) > 0
 
@@ -298,10 +309,25 @@ class Car:
 
       self.CC_prev = CC
 
+  def gateway_config_update(self, CS: car.CarState, CC: car.CarControl) -> None:
+    if self.gateway_config_bridge is None:
+      return
+    # Configuration must remain available while parked/offroad, when
+    # onroadEvents is intentionally absent and the normal controls send path
+    # does not run. card is still the sole sendcan publisher, and Panda applies
+    # the same independent parked/control-off safety gate.
+    config_safe = (self.sm.all_alive(['carControl']) and CS.canValid and CS.standstill and
+                   abs(CS.vEgo) < 0.01 and CS.gearShifter == structs.CarState.GearShifter.park and
+                   not CC.enabled and not CC.latActive and not CC.longActive)
+    config_sends = self.gateway_config_bridge.next_send(config_safe)
+    if config_sends:
+      self.pm.send('sendcan', can_list_to_can_capnp(config_sends, msgtype='sendcan', valid=CS.canValid))
+
   def step(self):
     CS, CS_SP, RD = self.state_update()
 
     self.state_publish(CS, CS_SP, RD)
+    self.gateway_config_update(CS, self.sm['carControl'])
 
     initialized = (not any(e.name == EventName.selfdriveInitializing for e in self.sm['onroadEvents']) and
                    self.sm.seen['onroadEvents'])
@@ -313,6 +339,7 @@ class Car:
     self.CS_SP_prev = CS_SP
 
   def params_thread(self, evt):
+    gateway_bridge_health_at = time.monotonic() + GATEWAY_CONFIG_BRIDGE_HEALTH_INTERVAL
     while not evt.is_set():
       self.is_metric = self.params.get_bool("IsMetric")
       self.experimental_mode = self.params.get_bool("ExperimentalMode") and self.CP.openpilotLongitudinalControl
@@ -321,6 +348,12 @@ class Car:
       self.dynamic_experimental_control = self.params.get_bool("DynamicExperimentalControl")
       self.v_cruise_helper.read_custom_set_speed_params()
       self.tesla_adapter.service_params(self.params)
+
+      # Keep IPC lifecycle work outside card's CAN-driven 100 Hz loop. start()
+      # is idempotent and only creates a worker if the previous one exited.
+      if self.gateway_config_bridge is not None and time.monotonic() >= gateway_bridge_health_at:
+        self.gateway_config_bridge.start()
+        gateway_bridge_health_at = time.monotonic() + GATEWAY_CONFIG_BRIDGE_HEALTH_INTERVAL
 
       time.sleep(0.1)
 
@@ -333,6 +366,8 @@ class Car:
         self.step()
         self.rk.monitor_time()
     finally:
+      if self.gateway_config_bridge is not None:
+        self.gateway_config_bridge.close()
       e.set()
       t.join()
 

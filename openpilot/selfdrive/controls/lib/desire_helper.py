@@ -3,6 +3,7 @@ from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.selfdrive.controls.lib.auto_lane_change import AutoLaneChangeController, AutoLaneChangeMode
 from openpilot.sunnypilot.selfdrive.controls.lib.lane_turn_desire import LaneTurnController
+from openpilot.sunnypilot.selfdrive.controls.lib.turn_entry import TurnManeuver
 
 LaneChangeState = log.LaneChangeState
 LaneChangeDirection = log.LaneChangeDirection
@@ -11,6 +12,8 @@ TurnDirection = custom.ModelDataV2SP.TurnDirection
 LANE_CHANGE_SPEED_MIN = 20 * CV.MPH_TO_MS
 LANE_CHANGE_TIME_MAX = 10.
 LANE_CHANGE_START_TIME = 0.5
+LANE_CHANGE_CANCEL_TIME_MAX = 2.0
+NAV_LANE_CHANGE_FINISH_TIME = 1.0  # CP's finishing/recovery phase, without a new lateral controller.
 
 TURN_DESIRES = {
   TurnDirection.none: log.Desire.none,
@@ -28,11 +31,18 @@ class DesireHelper:
     self.alc = AutoLaneChangeController(self)
     self.lane_turn_controller = LaneTurnController(self)
     self.lane_turn_direction = TurnDirection.none
+    self.turn_decision_reason = 'notObserved'
     self._active_nav_signal_direction: str | None = None
     self._active_nav_signal_turn_only = False
     self._active_nav_signal_feedback = False
     self._nav_signal_tail_direction: str | None = None
     self._nav_signal_tail_turn_only = False
+    self._cancelled_signal = False
+    self._signal_direction = None
+    self._signal_is_lane_change = False
+    self.turn_maneuver = TurnManeuver()
+    self._nav_change_key = None
+    self._completed_nav_change_key = None
 
   @staticmethod
   def get_lane_change_direction(left_blinker, right_blinker):
@@ -40,10 +50,20 @@ class DesireHelper:
 
   def update(self, carstate, lateral_active, lane_change_prob, left_edge_detected=False, right_edge_detected=False,
              nav_lane_intent=None, left_line_blocked=False, right_line_blocked=False,
-             left_crossing_allowed=False, right_crossing_allowed=False):
+             left_crossing_allowed=False, right_crossing_allowed=False,
+             left_start_allowed=True, right_start_allowed=True,
+             left_safety_blocked=False, right_safety_blocked=False,
+             left_turn_allowed=None, right_turn_allowed=None,
+             left_neighbor_exists=None, right_neighbor_exists=None,
+             left_turn_keep_allowed=None, right_turn_keep_allowed=None, turn_completed=False, turn_soft_reentry=False):
     self.alc.update_params()
     self.lane_turn_controller.update_params()
     v_ego = carstate.vEgo
+    # Explicit permissions opt the Tesla adapter into the separated entry.
+    # Other callers retain their existing turn contract.
+    separate_turn_entry = left_turn_allowed is not None or right_turn_allowed is not None
+    if not separate_turn_entry:
+      left_turn_allowed, right_turn_allowed = left_start_allowed, right_start_allowed
     # targetLaneIndex < 0 is a physical pre-turn lamp request only. Keep it out
     # of the lane-change state machine so an upcoming turn cannot become a
     # lateral lane-change desire.
@@ -52,7 +72,11 @@ class DesireHelper:
     )
     nav_direction = str(nav_lane_intent.direction) if nav_requested else "none"
     nav_signal = bool(nav_requested and nav_lane_intent.targetLaneIndex >= 0)
+    nav_fork = bool(nav_signal and getattr(nav_lane_intent, "forkNow", False))
     nav_turn_only = bool(nav_requested and nav_lane_intent.targetLaneIndex < 0 and nav_direction in ("left", "right"))
+    nav_change_key = ((getattr(nav_lane_intent, "sessionId", ""),
+                       getattr(nav_lane_intent, "maneuverEventId", 0),
+                       getattr(nav_lane_intent, "requestId", 0), nav_direction) if nav_signal else None)
     if (self._active_nav_signal_direction is not None
         and (not nav_requested or nav_direction != self._active_nav_signal_direction)):
       if self._active_nav_signal_feedback:
@@ -98,7 +122,13 @@ class DesireHelper:
     left_blinker = bool((carstate.leftBlinker and not suppress_turn_only_left) or nav_left)
     right_blinker = bool((carstate.rightBlinker and not suppress_turn_only_right) or nav_right)
     one_blinker = left_blinker != right_blinker
-    below_lane_change_speed = v_ego < LANE_CHANGE_SPEED_MIN
+    # jihui CP fork now clears its ordinary lane-change speed floor. Keep this
+    # scoped to a navigation fork; physical lamps alone do not grant it.
+    below_lane_change_speed = v_ego <= 0.0 or (v_ego < LANE_CHANGE_SPEED_MIN and not nav_fork)
+    if not carstate.leftBlinker and not carstate.rightBlinker and not nav_requested:
+      self._cancelled_signal = False
+    left_hard_blocked = carstate.leftBlindspot or left_edge_detected or left_line_blocked or left_safety_blocked
+    right_hard_blocked = carstate.rightBlindspot or right_edge_detected or right_line_blocked or right_safety_blocked
 
     # A navigation lane-change lamp must not look like an intersection turn to
     # LaneTurnDesire. Turn-only navigation lamps and driver lamps retain the
@@ -118,11 +148,33 @@ class DesireHelper:
     lane_turn_left_blinker = bool(carstate.leftBlinker and not (nav_lane_signal_left or nav_lane_tail_left))
     lane_turn_right_blinker = bool(carstate.rightBlinker and not (nav_lane_signal_right or nav_lane_tail_right))
 
-    # Lane turn controller update
-    self.lane_turn_controller.update_lane_turn(blindspot_left=carstate.leftBlindspot, blindspot_right=carstate.rightBlindspot,
-                                               left_blinker=lane_turn_left_blinker,
-                                               right_blinker=lane_turn_right_blinker, v_ego=v_ego)
-    self.lane_turn_direction = self.lane_turn_controller.get_turn_direction()
+    # Classify the signal before considering speed eligibility. An observed
+    # neighbor blocks a turn below, but does not establish the driver's intent.
+    # A navigation lane request or an executed change consumes this purpose.
+    # CP permits a pending manual change to be reclassified by turn evidence.
+    signal_direction = ('left' if carstate.leftBlinker and not carstate.rightBlinker else
+                        'right' if carstate.rightBlinker and not carstate.leftBlinker else None)
+    if signal_direction != self._signal_direction:
+      self._signal_direction = signal_direction
+      self._signal_is_lane_change = False
+    neighbor = left_neighbor_exists if signal_direction == 'left' else right_neighbor_exists
+    lane_neighbor = left_neighbor_exists if left_blinker else right_neighbor_exists
+    lane_start_allowed = left_start_allowed if left_blinker else right_start_allowed
+    if separate_turn_entry and not nav_turn_only and signal_direction is not None and (
+        nav_signal or self.lane_change_state in (LaneChangeState.laneChangeStarting, LaneChangeState.laneChangeFinishing)):
+      self._signal_is_lane_change = True
+    if nav_turn_only and nav_direction == signal_direction:
+      self._signal_is_lane_change = False  # Explicit new turn purpose, not a speed change.
+
+    reclassify_turn = (separate_turn_entry and not self._signal_is_lane_change and not self._cancelled_signal
+                      and signal_direction is not None and neighbor is False
+                      and self.lane_change_state == LaneChangeState.preLaneChange
+                      and self.lane_turn_controller.enabled and 0 <= v_ego < self.lane_turn_controller.lane_turn_value
+                      and (left_turn_allowed if signal_direction == 'left' else right_turn_allowed))
+    if reclassify_turn:
+      self.lane_change_state = LaneChangeState.off
+      self.lane_change_direction = LaneChangeDirection.none
+      self.lane_change_timer = 0.0
 
     if (not lateral_active or self.lane_change_timer > LANE_CHANGE_TIME_MAX or
         self.alc.lane_change_set_timer == AutoLaneChangeMode.OFF):
@@ -130,7 +182,13 @@ class DesireHelper:
       self.lane_change_direction = LaneChangeDirection.none
       self.lane_change_timer = 0.0
     else:
-      if self.lane_change_state == LaneChangeState.off and one_blinker and not self.prev_one_blinker and not below_lane_change_speed:
+      if self._cancelled_signal and self.lane_change_state != LaneChangeState.laneChangeFinishing:
+        self.lane_change_state = LaneChangeState.off
+        self.lane_change_direction = LaneChangeDirection.none
+        self.lane_change_timer = 0.0
+      elif (self.lane_change_state == LaneChangeState.off and one_blinker and not self.prev_one_blinker
+            and not below_lane_change_speed
+            and not (separate_turn_entry and lane_neighbor is False and not lane_start_allowed)):
         self.lane_change_state = LaneChangeState.preLaneChange
         self.lane_change_timer = 0.0
         # Initialize lane change direction to prevent UI alert flicker
@@ -144,8 +202,8 @@ class DesireHelper:
                          ((carstate.steeringTorque > 0 and self.lane_change_direction == LaneChangeDirection.left) or
                           (carstate.steeringTorque < 0 and self.lane_change_direction == LaneChangeDirection.right))
 
-        left_blocked = carstate.leftBlindspot or left_edge_detected or left_line_blocked
-        right_blocked = carstate.rightBlindspot or right_edge_detected or right_line_blocked
+        left_blocked = left_hard_blocked
+        right_blocked = right_hard_blocked
         blindspot_detected = ((left_blocked and self.lane_change_direction == LaneChangeDirection.left) or
                               (right_blocked and self.lane_change_direction == LaneChangeDirection.right))
 
@@ -156,12 +214,21 @@ class DesireHelper:
         nav_crossing_allowed = bool(
           (nav_left and left_crossing_allowed) or (nav_right and right_crossing_allowed)
         )
-        nav_not_ready = nav_signal and not (
+        nav_not_ready = nav_signal and (nav_change_key == self._completed_nav_change_key or not (
           physical_nav_signal_on and nav_crossing_allowed and bool(getattr(nav_lane_intent, "spLaneChangeReady", False))
-        )
-        lane_change_blocked = blindspot_detected or nav_not_ready
+        ) or (nav_fork and (carstate.steeringPressed or carstate.brakePressed)))
+        permission_blocked = not (left_start_allowed if self.lane_change_direction == LaneChangeDirection.left else right_start_allowed)
+        lane_change_blocked = blindspot_detected or nav_not_ready or permission_blocked
 
-        self.alc.update_lane_change(lane_change_blocked, carstate.brakePressed)
+        # Eligibility still gates every start below. Only an actual blindspot
+        # or road-edge obstruction resets the configured recovery timer; vision
+        # and OEM permission already have their own confirmation requirements.
+        recovery_blocked = (
+          (carstate.leftBlindspot or left_edge_detected)
+          if self.lane_change_direction == LaneChangeDirection.left
+          else (carstate.rightBlindspot or right_edge_detected)
+        )
+        self.alc.update_lane_change(recovery_blocked, carstate.brakePressed)
 
         if not one_blinker or below_lane_change_speed:
           self.lane_change_state = LaneChangeState.off
@@ -171,18 +238,119 @@ class DesireHelper:
           if (torque_applied or self.alc.auto_lane_change_allowed) and not lane_change_blocked:
             self.lane_change_state = LaneChangeState.laneChangeStarting
             self.lane_change_timer = 0.0
+            self._nav_change_key = nav_change_key if nav_signal else None
 
       elif self.lane_change_state == LaneChangeState.laneChangeStarting:
         self.lane_change_timer += DT_MDL
-
-        if lane_change_prob < 0.02 and self.lane_change_timer >= LANE_CHANGE_START_TIME:
+        hard_blocked = left_hard_blocked if self.lane_change_direction == LaneChangeDirection.left else right_hard_blocked
+        nav_interrupted = self._nav_change_key is not None and (
+          nav_change_key != self._nav_change_key or not one_blinker or
+          not (carstate.leftBlinker if self.lane_change_direction == LaneChangeDirection.left else carstate.rightBlinker) or
+          carstate.steeringPressed or carstate.brakePressed)
+        if hard_blocked or below_lane_change_speed or nav_interrupted:
+          # Withdraw the manoeuvre desire, not steering control. Do not turn a
+          # held lane-change lamp into a fresh low-speed turn or another change.
+          self._cancelled_signal = True
+          self.lane_change_state = LaneChangeState.laneChangeFinishing
+          # Finishing without a direction denotes cancellation, not success.
+          self.lane_change_direction = LaneChangeDirection.none
           self.lane_change_timer = 0.0
-          if one_blinker:
+        elif lane_change_prob < 0.02 and self.lane_change_timer >= LANE_CHANGE_START_TIME:
+          self.lane_change_timer = 0.0
+          if self._nav_change_key is not None:
+            # Same-direction finishing denotes normal model completion. A
+            # direction of none remains the existing cancellation contract.
+            self.lane_change_state = LaneChangeState.laneChangeFinishing
+          elif one_blinker:
             self.lane_change_state = LaneChangeState.preLaneChange
             self.lane_change_direction = self.get_lane_change_direction(left_blinker, right_blinker)
           else:
             self.lane_change_state = LaneChangeState.off
             self.lane_change_direction = LaneChangeDirection.none
+
+      elif self.lane_change_state == LaneChangeState.laneChangeFinishing:
+        self.lane_change_timer += DT_MDL
+        if self.lane_change_direction != LaneChangeDirection.none and self._nav_change_key is not None:
+          hard_blocked = left_hard_blocked if self.lane_change_direction == LaneChangeDirection.left else right_hard_blocked
+          physical_on = ((carstate.leftBlinker and not carstate.rightBlinker)
+                         if self.lane_change_direction == LaneChangeDirection.left else
+                         (carstate.rightBlinker and not carstate.leftBlinker))
+          if (hard_blocked or below_lane_change_speed or not physical_on or nav_change_key != self._nav_change_key
+              or carstate.steeringPressed or carstate.brakePressed):
+            self._cancelled_signal = True
+            self.lane_change_direction = LaneChangeDirection.none
+            self.lane_change_timer = 0.0
+          elif self.lane_change_timer >= NAV_LANE_CHANGE_FINISH_TIME:
+            self._completed_nav_change_key = self._nav_change_key
+            self.lane_change_state = LaneChangeState.preLaneChange
+            self.lane_change_timer = 0.0
+        elif ((lane_change_prob < 0.02 and self.lane_change_timer >= LANE_CHANGE_START_TIME)
+            or self.lane_change_timer >= LANE_CHANGE_CANCEL_TIME_MAX):
+          self.lane_change_state = LaneChangeState.off
+          self.lane_change_direction = LaneChangeDirection.none
+          self.lane_change_timer = 0.0
+
+    # Boundary memory cannot be erased just by calling the move a turn.
+    # TurnEntryGate also keeps its own memory, independent of navigation policy.
+    left_turn_blocked = (carstate.leftBlindspot or left_safety_blocked or left_line_blocked) if separate_turn_entry else left_hard_blocked
+    right_turn_blocked = (carstate.rightBlindspot or right_safety_blocked or right_line_blocked) if separate_turn_entry else right_hard_blocked
+    # CP's turn branch lacks its lane-change torque cancellation. Keep driver
+    # override priority when reusing that intent on SP.
+    opposing_torque = carstate.steeringPressed and (
+      (signal_direction == 'left' and carstate.steeringTorque < 0)
+      or (signal_direction == 'right' and carstate.steeringTorque > 0))
+    if separate_turn_entry and opposing_torque:
+      self._cancelled_signal = True
+    low_speed_turn_blocked = (
+      (lane_turn_left_blinker and not lane_turn_right_blinker and left_turn_blocked)
+      or (lane_turn_right_blinker and not lane_turn_left_blinker and right_turn_blocked)
+    )
+    if (not separate_turn_entry and lateral_active and self.lane_turn_controller.enabled
+        and v_ego < self.lane_turn_controller.lane_turn_value and low_speed_turn_blocked):
+      self._cancelled_signal = True
+    turn_allowed = (lateral_active and not self._cancelled_signal and not self._signal_is_lane_change
+                    and self.lane_change_state == LaneChangeState.off
+                    and not (separate_turn_entry and neighbor is True))
+    if separate_turn_entry:
+      left_keep = left_turn_allowed if left_turn_keep_allowed is None else left_turn_keep_allowed
+      right_keep = right_turn_allowed if right_turn_keep_allowed is None else right_turn_keep_allowed
+      selected_left = signal_direction == 'left'
+      requested = lane_turn_left_blinker if selected_left else lane_turn_right_blinker
+      active_turn = self.turn_maneuver.update(
+        signal_direction,
+        eligible=(turn_allowed and requested and self.lane_turn_controller.enabled
+                  and 0 <= v_ego < self.lane_turn_controller.lane_turn_value),
+        entry_allowed=left_turn_allowed if selected_left else right_turn_allowed,
+        keep_allowed=left_keep if selected_left else right_keep,
+        hard_blocked=left_turn_blocked if selected_left else right_turn_blocked,
+        completed=turn_completed,
+        retry_soft_loss=turn_soft_reentry,
+      )
+      left_turn_allowed = active_turn and selected_left
+      right_turn_allowed = active_turn and not selected_left
+      if self.turn_maneuver.state == 'finished':
+        self._cancelled_signal = True  # All exits consume this signal, including a speed exit.
+    self.lane_turn_controller.update_lane_turn(
+      blindspot_left=left_turn_blocked, blindspot_right=right_turn_blocked,
+      left_blinker=lane_turn_left_blinker and turn_allowed and left_turn_allowed and not lane_turn_right_blinker,
+      right_blinker=lane_turn_right_blinker and turn_allowed and right_turn_allowed and not lane_turn_left_blinker, v_ego=v_ego,
+    )
+    self.lane_turn_direction = self.lane_turn_controller.get_turn_direction()
+    # Diagnostic only: keep the output and all authorization conditions above unchanged.
+    self.turn_decision_reason = (
+      'legacyEntry' if not separate_turn_entry else
+      'noSingleSignal' if signal_direction is None else
+      'lateralInactive' if not lateral_active else
+      'turnDisabled' if not self.lane_turn_controller.enabled else
+      'signalConsumed' if self._cancelled_signal else
+      'signalClassifiedAsLaneChange' if self._signal_is_lane_change else
+      'laneChangeInProgress' if self.lane_change_state != LaneChangeState.off else
+      'neighborPresent' if neighbor is True else
+      'signalOwnedByLaneChange' if not requested else
+      'speedIneligible' if not 0 <= v_ego < self.lane_turn_controller.lane_turn_value else
+      'boundaryOrSafetyBlocked' if (left_turn_blocked if selected_left else right_turn_blocked) else
+      'turnActive' if active_turn else 'entryNotConfirmed'
+    )
 
     self.prev_one_blinker = one_blinker and lateral_active
 

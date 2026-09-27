@@ -4,6 +4,24 @@ This module is an isolated, closed-course-only ingress path for high-level
 mobile navigation observations. It does not accept actuator, curvature,
 acceleration, CarState, or CAN commands.
 
+## NOA data-use principle
+
+NOA follows **maximize useful data, fuse by authority, and fail closed**. Every
+semantically verified, fresh, valid, and plausible signal already available
+from C3 perception/localization/radar/control state or from the OEM vehicle and
+head-unit buses should be reused and cross-checked instead of duplicated or
+discarded. AMap supplies route intent and map priors; C3 perception supplies
+continuous physical geometry and objects; OEM messages supply actual vehicle,
+driver, blind-spot, radar, lane-position, and vehicle-permission state.
+
+Safety and actuation decisions remain subordinate to fresh C3 control state and
+verified OEM feedback. No navigation, vision, or CAN source by itself may
+bypass solid-line, blind-spot, driver-override, controller-state, or vehicle
+permission gates. New bus signals require replay or vehicle validation plus
+freshness, validity, range, continuity, conflict, and diagnostic handling.
+Unknown, stale, implausible, or conflicting inputs fail closed; absence is never
+interpreted as permission.
+
 ## Arming
 
 The manager keeps the network-only `navassistd` receiver available on a Tesla
@@ -155,24 +173,60 @@ Tesla physical turn signal. A linked left/right route maneuver may request a
 bounded pre-turn lamp with `targetLaneIndex = -1`; DesireHelper suppresses both
 its physical feedback and cancellation tail at the ALC entrance. Navigation
 publishes a target and diagnostic readiness only; SP's configured
-AutoLaneChangeController remains the sole start authority and requires current
-ego-side dashed evidence, clear BSM, active SP lateral, Panda TX echo, and
-physical lamp feedback. `OFF`/`NUDGE` remain authoritative. A same-direction
+AutoLaneChangeController remains the sole start authority and requires fresh
+OEM `0x239` lane-position/neighbor state, fresh direction-specific `0x399`
+permission, clear `0x399` BSM, active SP lateral, Panda TX echo, and physical
+lamp feedback. A fresh visual solid line or road edge remains an additional
+veto, but vision does not invent a neighbor or grant permission. `OFF`/`NUDGE`
+remain authoritative. A same-direction
 pre-turn lamp transfers to the lane-change request without blinking off. This path never
 accepts phone curvature or bypasses Panda safety, and every lane is re-observed
 before another request. AMap complete-road indices are never equated with local
-visual indices: only a direction-consistent recommendation touching the road
+OEM lane-position categories: only a direction-consistent recommendation touching the road
 edge can qualify relative edge alignment; an unanchored middle recommendation
-is display-only. While LaneInfo is absent, ordinary/sharp/U-turns can target the visual leftmost/rightmost lane
+is display-only. While LaneInfo is absent, ordinary/sharp/U-turns can target the OEM-reported leftmost/rightmost lane
 inside 1 km, and directional exit/ramp/merge events can do so inside 2 km;
 `slightLeft`/`slightRight` never force an extreme-lane fallback.
 Relative alignment adopts CP's temporal consistency without its global
-fail-open behavior: 0.5-second neighbor stability, 5-second edge confirmation,
+fail-open behavior: three stable, counter-contiguous `0x239` samples with a
+plausible virtual-lane width, at least 20 m view range, and direction-specific
+`AVAILABLE`/`FUSED` line evidence; two permissive `0x399`
+samples, 0.5-second neighbor stability, 5-second edge confirmation,
 3-second new-lane stability after an edge, 2-second post-change cooldown, pause
-during lateral transition/driver steering, and at most five changes per event.
-Lane alignment remains an internal preparation state while the crossing or BSM
-gate is blocked. It requests the physical lamp only when one SP lane-change
-attempt can start, then holds that lamp through the existing SP cycle. A
+during lateral transition/driver steering, and a configured change budget.
+As of the 2026-09-22 highway/elevated-road closure fix, relative alignment ends
+after one SP cycle with `laneChangeCompletionUnconfirmed`: local/OEM indices
+cannot independently prove a crossing. It does not count success or request
+another step for that manoeuvre. Readiness is withdrawn while waiting for the
+cycle-end confirmation, including observation gaps. Cancelled and unconfirmed
+events stay latched across inactive/event-zero input and revision-only changes;
+only a valid nonzero new manoeuvre or a valid new navigation session releases
+the latch. This latch is process-local, not persisted across daemon restarts.
+Continuous relative alignment still requires independent completion evidence;
+the configured count alone does not enable it. Existing absolute-index plans
+retain their stable-index completion check.
+The `0x239` center polynomial and fork state remain C3-local diagnostics for
+now; they do not create steering requests or bypass any gate. The App-facing
+UDP acknowledgement retains its existing schema.
+Navigation samples record raw `can239` alongside the existing `can399` list,
+including event timestamps, validity, source bus and DLC. Eight-byte 239 rows
+also contain values from the same decoder used by OEM feedback. Decoded values
+are observations, not permission: line usage is not solid/dashed paint, and
+view range is not a boundary endpoint. Offroad 239 frames are buffered until
+the existing sample/write trigger, with a 32-frame cap and an explicit
+`can239_dropped` count on overflow. Disabling recording clears pending frames.
+Onroad samples also store bounded 33-point model trajectories, lane lines and
+road edges, with frame IDs, camera EOF timestamps and prediction time axes.
+MADS state, measured steering/torque/yaw rate, requested actuators and
+`carOutput.actuatorsOutput` are recorded separately at the existing 20 Hz loop.
+`driverIntervention.madsSteeringPressed` means the MADS feature is available
+and the vehicle reports steering pressed; it is not a label of pure human
+control. Use the recorded MADS state and lateral-active state to distinguish
+active overrides from ordinary manual driving. Missing/stale input is null.
+Lane alignment requests the physical lamp at the navigation-owned timing, then
+waits in the signaling phase while `0x399`, BSM, or a visual boundary veto is
+blocked. It marks the request ready only after all C3-local gates and physical
+lamp feedback are stable, then holds that lamp through the existing SP cycle. A
 navigation lane-change lamp is excluded from LaneTurnDesire; only a true
 turn-only request or a driver lamp may create turnLeft/turnRight desire.
 When a new same-direction turn request takes ownership of a still-lit lamp,
@@ -185,12 +239,10 @@ of changes in visible lane count. A short topology observation gap does not
 pretend that actual lateral control became inactive. The existing Tesla signal
 controller honors navigation's hold policy for starting-to-pre transitions as
 well as finishing/off, so the coordinator owns normal completion cancellation.
-An ordinary navigation lane request applies CP's unknown-is-open policy but
-still blocks confirmed solid paint. The explicitly requested `forkNow`
-exception is limited to a fresh directional exit/ramp/merge at 50 metres or
-less. It can skip neighbor stability and additionally ignore solid paint, while
-stale/ambiguous topology, SP road
-edge, BSM, pedals, lateral authority, and physical-lamp gates remain mandatory.
+No navigation request, including an imminent exit or ramp, may bypass stale or
+negative `0x239`/`0x399` state. Confirmed visual solid paint or a road edge,
+BSM, pedals, lateral-authority loss, and missing physical-lamp feedback also
+block the manoeuvre.
 Lane positioning itself never creates a speed target. A supported turn/exit
 maneuver may still activate its comfort-distance speed ceiling while a final
 lane change is in progress. Once the admitted ceiling activates, it remains as
@@ -210,4 +262,4 @@ before any active test.
 Android does not infer a directional `exit_left/right` or `ramp_left/right`
 event from road text alone. Android and iOS can both carry explicit directional
 maneuvers; those events may request one-lane-at-a-time positioning through the
-same visual/dashed/BSM gates.
+same OEM permission, neighbor, visual-veto, and BSM gates.

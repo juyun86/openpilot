@@ -11,9 +11,11 @@ from opendbc.car.structs import car
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.common.params import Params
 import openpilot.system.manager.manager as manager
+import openpilot.system.manager.process as manager_process
 import openpilot.system.manager.process_config as process_config
-from openpilot.system.manager.process import ensure_running
+from openpilot.system.manager.process import RestartingPythonProcess, ensure_running
 from openpilot.system.manager.process_config import managed_processes, procs
+from openpilot.selfdrive.selfdrived.events import IGNORED_PROCESSES
 from openpilot.common.hardware import HARDWARE
 from openpilot.sunnypilot.hardware.profile import HardwareProfile
 
@@ -54,14 +56,14 @@ class TestManager(OpenpilotTestCase):
     assert params.get("OpenpilotEnabledToggle")
     assert params.get("RouteCount") == 0
 
-  def test_c3xl_startup_disables_existing_road_video_setting(self, monkeypatch):
+  def test_c3xl_startup_preserves_enabled_road_video_setting(self, monkeypatch):
     monkeypatch.setattr(manager, "get_hardware_profile", lambda: HardwareProfile.C3XL)
     params = Params()
     params.put_bool("RecordRoadVideo", True, block=True)
 
     manager.apply_local_recording_policy(params)
 
-    assert not params.get_bool("RecordRoadVideo")
+    assert params.get_bool("RecordRoadVideo")
 
   def test_quick_boot_never_fabricates_prebuilt_marker(self):
     source = inspect.getsource(manager.manager_init)
@@ -80,6 +82,45 @@ class TestManager(OpenpilotTestCase):
   def test_local_process_seams_remain_registered(self):
     for name in ("device_console", "tesla_hotspotd", "alert_output", "chestnut_statusd", "trafficcontrold", "local_diagnosticsd"):
       assert name in managed_processes
+
+  def test_device_console_is_restartable_and_noncritical(self):
+    process = managed_processes["device_console"]
+    assert isinstance(process, RestartingPythonProcess)
+    assert IGNORED_PROCESSES == frozenset({"mapd", process.name})
+    assert "gateway_configd" not in managed_processes
+
+  def test_restarting_python_process_reaps_dead_child_after_backoff(self, monkeypatch):
+    class FakeProcess:
+      next_pid = 100
+
+      def __init__(self, *args, **kwargs):
+        self.pid = self.next_pid
+        FakeProcess.next_pid += 1
+        self.exitcode = None
+
+      def start(self):
+        pass
+
+      def is_alive(self):
+        return self.exitcode is None
+
+    now = [0.0]
+    monkeypatch.setattr(manager_process, "Process", FakeProcess)
+    monkeypatch.setattr(manager_process.time, "monotonic", lambda: now[0])
+    process = RestartingPythonProcess("optional", "fake.module", lambda *_: True, restart_delay=5.0)
+
+    process.start()
+    first_pid = process.proc.pid
+    process.proc.exitcode = 1
+
+    now[0] = 4.9
+    process.start()
+    assert process.proc.pid == first_pid
+
+    now[0] = 5.0
+    process.start()
+    assert process.proc.pid != first_pid
+    assert process.proc.exitcode is None
 
   def test_tesla_hotspot_process_is_c3xl_profile_scoped(self, monkeypatch):
     params = Params()

@@ -35,7 +35,7 @@ VALIDATION_LOG_PATH = "/data/tesla_turn_signal_validation.log"
 VALIDATION_LOG_PREFIX = "[TESLA-TURN-SIGNAL-VALIDATION-v3]"
 MAX_LOG_BYTES = 2 * 1024 * 1024
 # Validation results still return through Params, while raw evidence logging is
-# disabled on the normal dev branch. Toggle only for a focused diagnostic run.
+# disabled on the normal dev branch except for Panda-rejected sessions.
 TURN_SIGNAL_VALIDATION_LOGGING_ENABLED = False
 
 _UI_WARNING_MESSAGE = DBC("tesla_model3_party").name_to_msg["UI_warning"]
@@ -114,7 +114,8 @@ def decode_front_lighting(data: bytes) -> dict[str, int | bool]:
 
 
 def persist_validation_records(records: list[dict], log_path: str = VALIDATION_LOG_PATH) -> None:
-  if not TURN_SIGNAL_VALIDATION_LOGGING_ENABLED or not records:
+  if not records or (not TURN_SIGNAL_VALIDATION_LOGGING_ENABLED and
+                     not any(record.get("can_direction") == "rejected" for record in records)):
     return
   try:
     if os.path.exists(log_path) and os.path.getsize(log_path) > MAX_LOG_BYTES:
@@ -131,6 +132,8 @@ class TeslaTurnSignalRealtimeController:
     self.configured = configured
     self._lock = threading.Lock()
     self._active = None
+    self._cancel_failure = None
+    self._lamp_feedback = {}
     self._completed: list[tuple[dict, list[dict]]] = []
     self._template = None
     self._template_nanos = 0
@@ -156,6 +159,13 @@ class TeslaTurnSignalRealtimeController:
     if self._active is None:
       return
     session = self._active
+    if session["cancel_requested"] and result not in ("PASS", "CANCELLED_BEFORE_SEND"):
+      # Keep the unresolved hardware cancellation visible. A new request/session
+      # is not proof of cancellation; later acknowledged, physical OFF feedback
+      # can resolve this same attempt without restarting card.
+      session["phase"] = "cancel_failed"
+      session["result"] = result
+      self._cancel_failure = session
     payload = {
       "test_id": session["test_id"],
       "direction": session["direction"],
@@ -181,6 +191,8 @@ class TeslaTurnSignalRealtimeController:
     if not SESSION_TIMEOUT_NS <= int(session_timeout_ns) <= MAX_SESSION_TIMEOUT_NS:
       raise ValueError("turn-signal session timeout is outside the bounded range")
     with self._lock:
+      if self._cancel_failure is not None:
+        return False
       if not self.configured:
         records = [{
           "prefix": VALIDATION_LOG_PREFIX,
@@ -219,8 +231,11 @@ class TeslaTurnSignalRealtimeController:
         "action_frames_sent": 0,
         "action_frames_echoed": 0,
         "cancel_sent": False,
+        "cancel_frames": [],
         "cancel_attempts": 0,
+        "cancel_rejections": 0,
         "cancel_echoed": False,
+        "cancel_ack_nanos": 0,
         "cancel_requested": False,
         "cancel_requested_nanos": 0,
         "cancel_reason": None,
@@ -307,6 +322,20 @@ class TeslaTurnSignalRealtimeController:
             and not self._active["hold_until_cancel"]):
         self._request_cancel_locked("lane_change_state_off", now_nanos)
 
+  def _lamps_off_confirmed(self, session: dict, now_nanos: int) -> bool:
+    if not session["cancel_echoed"]:
+      return False
+    # UI_warning distinguishes truly OFF (0) from the dark phase of blinking
+    # (1). Front-lighting OFF must also be explicit: FAULT/SNA are not OFF.
+    # Reuse the existing vehicle-feedback window, with observations after the
+    # cancellation acknowledgement. TX echo alone never proves lamp state.
+    for address in (UI_WARNING_ADDRESS, FRONT_LIGHTING_ADDRESS):
+      stamp, left, right = self._lamp_feedback.get(address, (0, -1, -1))
+      if not (stamp > session["cancel_ack_nanos"] and 0 <= now_nanos - stamp <= VEHICLE_FEEDBACK_TIMEOUT_NS
+              and left == 0 and right == 0):
+        return False
+    return True
+
   def observe_frame(self, monotonic_nanos: int, address: int, data: bytes, source: int) -> None:
     if address not in (DAS_BODY_CONTROLS_ADDRESS, UI_WARNING_ADDRESS, FRONT_LIGHTING_ADDRESS):
       return
@@ -316,12 +345,51 @@ class TeslaTurnSignalRealtimeController:
         self._template = data
         self._template_nanos = int(monotonic_nanos)
         self._template_generation += 1
+        if self._active is not None and self._active["awaiting_phase"] == "cancel":
+          self._record_locked("cancel_pending_template", monotonic_nanos,
+                              source=source, bus=VEHICLE_BUS, data=data.hex(),
+                              decoded=decode_body_controls(data), template_generation=self._template_generation)
 
+      bus, can_direction = source_details(source)
+      decoded = None
+      if address == UI_WARNING_ADDRESS and bus == PARTY_BUS and can_direction == "rx" and len(data) == 7:
+        decoded = decode_ui_warning(data)
+      elif address == FRONT_LIGHTING_ADDRESS and bus == VEHICLE_BUS and can_direction == "rx" and len(data) == 8:
+        decoded = decode_front_lighting(data)
+      if decoded is not None:
+        if monotonic_nanos >= self._lamp_feedback.get(address, (0,))[0]:
+          self._lamp_feedback[address] = (int(monotonic_nanos), decoded["left_blinker_state"], decoded["right_blinker_state"])
+
+      if self._cancel_failure is not None:
+        failed = self._cancel_failure
+        if (address == DAS_BODY_CONTROLS_ADDRESS and bus == VEHICLE_BUS and can_direction == "txEcho"
+            and data in failed["cancel_frames"]):
+          failed["cancel_echoed"] = True
+          failed["cancel_ack_nanos"] = int(monotonic_nanos)
+          failed["awaiting_data"] = None
+          failed["awaiting_phase"] = None
+        if decoded is not None and self._lamps_off_confirmed(failed, monotonic_nanos):
+          self._completed.append(({
+            "test_id": failed["test_id"], "direction": failed["direction"], "result": "CANCEL_RECOVERED",
+            "previous_result": failed["result"], "feedback": failed["feedback"],
+            "tx_echo": failed["tx_echo"], "cancel_sent": failed["cancel_sent"],
+          }, []))
+          self._cancel_failure = None
+        elif not failed["cancel_sent"] and is_original_body_controls_frame(address, source, data):
+          # The bus/template recovered before any cancellation could be sent.
+          # Resume only that pending cancel, under the same CAN/attempt limits;
+          # never treat the new template as permission for another action.
+          failed["phase"] = "cancelling"
+          failed["cancel_requested_nanos"] = int(monotonic_nanos)
+          failed.pop("result", None)
+          self._active, self._cancel_failure = failed, None
+        return
       if self._active is None:
         return
 
-      bus, can_direction = source_details(source)
-      if address == DAS_BODY_CONTROLS_ADDRESS and data == self._active["awaiting_data"]:
+      if (address == DAS_BODY_CONTROLS_ADDRESS and bus == VEHICLE_BUS
+          and (data == self._active["awaiting_data"]
+               or (can_direction == "txEcho" and data in self._active["cancel_frames"]))):
         if can_direction == "rejected":
           phase = self._active["awaiting_phase"]
           self._active["rejected"] = True
@@ -329,20 +397,31 @@ class TeslaTurnSignalRealtimeController:
                               can_direction=can_direction, phase=phase, data=data.hex(), decoded=decode_body_controls(data))
           self._active["awaiting_data"] = None
           self._active["awaiting_phase"] = None
+          if phase == "cancel":
+            self._active["cancel_rejections"] += 1
           if phase == "action" and self._active["action_frames_echoed"] > 0:
             self._request_cancel_locked("action_panda_rejected", monotonic_nanos)
+          elif phase == "cancel" and self._active["cancel_rejections"] == self._active["cancel_attempts"]:
+            # Explicit rejection is not a lost acknowledgement. Retry only the
+            # pending cancel on a new OEM template, within the existing budget.
+            if (self._active["cancel_attempts"] < MAX_CANCEL_ATTEMPTS and
+                monotonic_nanos - self._active["cancel_requested_nanos"] < CANCEL_TOTAL_TIMEOUT_NS):
+              self._active["phase"] = "cancelling"
+            else:
+              self._finish_locked("PANDA_REJECTED", monotonic_nanos)
           elif phase == "cancel" and self._active["cancel_attempts"] > 1:
             # A retry is expected to be rejected when the previous cancel was
             # accepted but its host-side TX echo was lost. Confirm via the
             # physical front-lighting feedback instead of sending more frames.
             self._active["cancel_echoed"] = True
+            self._active["cancel_ack_nanos"] = int(monotonic_nanos)
             self._active["phase"] = "confirming_cancel"
             self._active["finalize_nanos"] = int(monotonic_nanos) + CANCEL_FEEDBACK_TIMEOUT_NS
           else:
             self._finish_locked("PANDA_REJECTED", monotonic_nanos)
           return
         if can_direction == "txEcho":
-          phase = self._active["awaiting_phase"]
+          phase = "cancel" if data in self._active["cancel_frames"] else self._active["awaiting_phase"]
           self._active["tx_echo"] = True
           self._active["awaiting_data"] = None
           self._active["awaiting_phase"] = None
@@ -352,15 +431,11 @@ class TeslaTurnSignalRealtimeController:
             self._active["action_frames_echoed"] += 1
           else:
             self._active["cancel_echoed"] = True
+            self._active["cancel_ack_nanos"] = int(monotonic_nanos)
             self._active["phase"] = "confirming_cancel"
             self._active["finalize_nanos"] = int(monotonic_nanos) + CANCEL_FEEDBACK_TIMEOUT_NS
           return
 
-      decoded = None
-      if address == UI_WARNING_ADDRESS and bus == PARTY_BUS and can_direction == "rx" and len(data) == 7:
-        decoded = decode_ui_warning(data)
-      elif address == FRONT_LIGHTING_ADDRESS and bus == VEHICLE_BUS and can_direction == "rx" and len(data) == 8:
-        decoded = decode_front_lighting(data)
       if decoded is not None:
         blinker_on = bool(decoded[f"{self._active['direction']}_blinker"])
         if blinker_on and not self._active["feedback"]:
@@ -368,8 +443,7 @@ class TeslaTurnSignalRealtimeController:
           if not self._active["cancel_requested"]:
             self._active["phase"] = "waiting_sp_start"
           self._record_locked("vehicle_feedback", monotonic_nanos, source=source, bus=bus, data=data.hex(), decoded=decoded)
-        elif (not blinker_on and address == FRONT_LIGHTING_ADDRESS and self._active["feedback"] and
-              self._active["cancel_echoed"]):
+        if self._lamps_off_confirmed(self._active, monotonic_nanos):
           self._record_locked("vehicle_cancel_feedback", monotonic_nanos, source=source, bus=bus,
                               data=data.hex(), decoded=decoded)
           self._finish_locked("PASS", monotonic_nanos)
@@ -403,6 +477,7 @@ class TeslaTurnSignalRealtimeController:
       else:
         self._active["cancel_sent"] = True
         self._active["cancel_attempts"] += 1
+        self._active["cancel_frames"].append(data)
       self._record_locked("frame_submitted", now_nanos, phase=phase, request=TURN_REQUESTS[direction],
                           reason=CANCEL_TURN_REASON if phase == "cancel" else ACTIVE_TURN_REASON,
                           counter=counter, bus=VEHICLE_BUS, data=data.hex(),
@@ -452,18 +527,20 @@ class TeslaTurnSignalRealtimeController:
 
   def status(self) -> dict | None:
     with self._lock:
-      if self._active is None:
+      session = self._active if self._active is not None else self._cancel_failure
+      if session is None:
         return None
       return {
-        "test_id": self._active["test_id"],
-        "direction": self._active["direction"],
-        "phase": self._active["phase"],
-        "feedback": self._active["feedback"],
-        "action_frames_sent": self._active["action_frames_sent"],
-        "lane_change_started": self._active["lane_change_started"],
-        "cancel_requested": self._active["cancel_requested"],
-        "cancel_attempts": self._active["cancel_attempts"],
-        "cancel_reason": self._active["cancel_reason"],
+        "test_id": session["test_id"],
+        "direction": session["direction"],
+        "phase": session["phase"],
+        "feedback": session["feedback"],
+        "action_frames_sent": session["action_frames_sent"],
+        "lane_change_started": session["lane_change_started"],
+        "cancel_requested": session["cancel_requested"],
+        "cancel_attempts": session["cancel_attempts"],
+        "cancel_reason": session["cancel_reason"],
+        "result": session.get("result"),
       }
 
   def service_params(self, params, now_nanos: int | None = None, log_path: str = VALIDATION_LOG_PATH) -> None:

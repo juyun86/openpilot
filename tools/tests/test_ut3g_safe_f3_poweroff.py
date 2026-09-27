@@ -1,4 +1,4 @@
-from tools.ut3g_safe_f3_poweroff import PCIE_L0, PRODUCT, SafePowerOffError, safe_power_off
+from tools.ut3g_safe_f3_poweroff import ITGZ_PRODUCT, PCIE_L0, PRODUCT, SafePowerOffError, safe_power_off
 import pytest
 
 
@@ -45,3 +45,21 @@ def test_dirty_or_malformed_dual_product_is_rejected():
   usb.product = "custom d1377a01-UT3G-DUAL-DIRTY"
   with pytest.raises(SafePowerOffError, match="unexpected product"):
     safe_power_off(usb, sleeper=lambda _: None)
+
+
+def test_verified_itgz_product_uses_same_volatile_poweroff():
+  from openpilot.common.hardware.usb import ITGZ_PRODUCT as RUNTIME_PRODUCT
+  assert ITGZ_PRODUCT == RUNTIME_PRODUCT
+  usb = FakeUSB(PCIE_L0, 0)
+  usb.product = ITGZ_PRODUCT
+  report = safe_power_off(usb, sleeper=lambda _: None)
+  assert usb.writes == [(0xF3, {"value": 0, "timeout": 10_000})]
+  assert report["safe_to_cut_external_power"] is True
+
+
+def test_unverified_itgz_product_is_rejected_without_usb_requests():
+  usb = FakeUSB(PCIE_L0, 0)
+  usb.product = ITGZ_PRODUCT + "-DIRTY"
+  with pytest.raises(SafePowerOffError, match="unexpected product"):
+    safe_power_off(usb, sleeper=lambda _: None)
+  assert usb.writes == [] and usb.values == [PCIE_L0, 0]

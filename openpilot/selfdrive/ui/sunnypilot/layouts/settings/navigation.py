@@ -39,7 +39,8 @@ class NavigationLayout(Widget):
                               callback=lambda value, name=key: self.put(name, value), enabled=ui_state.is_offroad)
       else:
         action = OptionControlSP(key, spec.minimum, spec.maximum, spec.step, enabled=ui_state.is_offroad,
-                                 label_width=230, label_callback=lambda value, unit=spec.unit: f'{value} {unit}', params=self)
+                                 label_width=230, label_callback=lambda value, spec=spec: (spec.choices[value - spec.minimum] if spec.choices else
+                                   f'{value / 10:.1f} s' if spec.unit == '0.1 s' else f'{value} {spec.unit}'), params=self)
         item = ListItemSP(spec.title, description=spec.description, action_item=action, inline=False)
       self._controls[key] = item.action_item
       items.append(item)

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # ruff: noqa: E501  # The embedded HTML/CSS/JavaScript is intentionally compact.
+import ipaddress
 import json
+from pathlib import Path
+import socket
+import sys
 import threading
 import time
 from http import HTTPStatus
@@ -9,6 +13,7 @@ from typing import BinaryIO, cast
 from urllib.parse import parse_qs, urlparse
 
 from openpilot.sunnypilot.selfdrive.car.tesla.validation_controller import VALIDATION_LOG_PATH
+from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.debug.tesla_turn_signal_test import (
   cancel_validation_session,
   get_validation_status,
@@ -37,10 +42,23 @@ from openpilot.selfdrive.debug.driving_status import driving_status_snapshot
 from openpilot.selfdrive.debug.tesla_ambient_test import run_ambient_test
 from openpilot.selfdrive.debug.unknown_can_observer import start_unknown_can_observer
 from openpilot.selfdrive.debug.tesla_speed_button_test import SpeedButtonAction, run_validation
+from openpilot.selfdrive.gateway_configd.model import ConfigError, digest as gateway_digest, validate as validate_gateway_config
+from openpilot.selfdrive.gateway_configd.protocol import ProtocolError
+from openpilot.selfdrive.gateway_configd.service import DEFAULT_STATE_DIR, GatewayConfigService
+from openpilot.sunnypilot.hardware.profile import HardwareProfile, get_hardware_profile
 
 
 HOST = "0.0.0.0"
 PORT = 8088
+GATEWAY_STATIC = Path(__file__).resolve().parents[1] / "gateway_configd" / "static"
+MAX_GATEWAY_BODY = 16 * 1024
+MAX_REQUEST_THREADS = 8
+SOCKET_TIMEOUT_S = 10.0
+_PRIVATE_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
+  "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16",
+  "fc00::/7", "fe80::/10", "::1/128",
+))
+_TESLA_CONSOLE_ADDRESS = ipaddress.ip_address("99.99.99.99")
 _SESSION_LOCK = threading.Lock()
 _ACTIVE_WEB_TEST_ID: str | None = None
 _ACTIVE_WEB_SESSION_STARTED = 0.0
@@ -67,7 +85,7 @@ def render_page() -> bytes:
     :root { color-scheme:dark; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
     body { margin:0; background:#111827; color:#f9fafb; } main { max-width:840px; margin:auto; padding:18px 14px 42px; }
     h1 { font-size:24px; margin:4px 0; } p { color:#cbd5e1; line-height:1.45; } .tabs { display:flex; gap:8px; margin:18px 0; }
-    .tab, button { border:0; border-radius:12px; font-weight:700; color:white; background:#334155; padding:12px 16px; font-size:16px; }
+    .tab, button { border:0; border-radius:12px; font-weight:700; color:white; background:#334155; padding:12px 16px; font-size:16px; text-decoration:none; }
     .tab.active { background:#2563eb; } .notice { padding:11px 13px; border-radius:10px; margin:12px 0; background:#14532d; color:#dcfce7; }
     .notice.onroad { background:#7c2d12; color:#ffedd5; } .group { margin:22px 0 9px; color:#93c5fd; font-size:15px; }
     .category-nav { display:flex; gap:8px; overflow-x:auto; padding:4px 0 10px; position:sticky; top:0; background:#111827; z-index:1; } .category { white-space:nowrap; padding:9px 12px; font-size:14px; }
@@ -90,7 +108,7 @@ def render_page() -> bytes:
     .log-range { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:16px 0; } .log-range label { display:grid; gap:6px; color:#cbd5e1; font-size:13px; } .log-range input { width:100%; box-sizing:border-box; }
     .log-actions { display:flex; flex-wrap:wrap; gap:10px; align-items:center; } #log-download { background:#2563eb; } #log-delete { background:#dc2626; } #log-preview { min-height:52px; margin-top:14px; white-space:pre-wrap; }
     @media (max-width:600px) { .log-range, .chart-grid { grid-template-columns:1fr; } .chart-grid { gap:9px; } .signal-chart { height:210px; } }
-    .tabs { overflow-x:auto; } .tabs button { white-space:nowrap; }
+    .tabs { overflow-x:auto; } .tabs .tab { white-space:nowrap; }
     #vehicle-panel { margin:24px 0 30px; background:#111418; border:1px solid #282d33; border-radius:24px; padding:24px; }
     .vehicle-head { display:flex; align-items:center; justify-content:space-between; color:#dce3e8; letter-spacing:3px; font-size:16px; }
     .vehicle-head span { font-size:12px; letter-spacing:0; color:#8a97a3; } .vehicle-head #vehicle-connection::before { content:''; display:inline-block; width:6px; height:6px; border-radius:50%; background:#6ee2b4; margin-right:8px; }
@@ -130,7 +148,7 @@ def render_page() -> bytes:
   </style>
 </head><body><main>
   <h1>车载设置</h1><p>连接设备局域网后可直接访问普通设置；任意 Bash 终端单独使用密码。</p>
-  <div class="tabs"><button class="tab active" id="settings-tab" onclick="showPanel('settings')">设置</button><button class="tab" id="driving-tab" onclick="showPanel('driving')">行驶信息</button><button class="tab" id="logs-tab" onclick="showPanel('logs')">日志下载</button><button class="tab" id="navlogs-tab" onclick="showPanel('navlogs')">导航日志</button><button class="tab" id="turn-tab" onclick="showPanel('turn')">Tesla 验证</button><button class="tab" id="terminal-tab" onclick="showPanel('terminal')">终端</button></div>
+  <div class="tabs"><button class="tab active" id="settings-tab" onclick="showPanel('settings')">设置</button><button class="tab" id="driving-tab" onclick="showPanel('driving')">行驶信息</button><button class="tab" id="logs-tab" onclick="showPanel('logs')">日志下载</button><button class="tab" id="navlogs-tab" onclick="showPanel('navlogs')">导航日志</button><button class="tab" id="turn-tab" onclick="showPanel('turn')">Tesla 验证</button><button class="tab" id="terminal-tab" onclick="showPanel('terminal')">终端</button><a class="tab" id="gateway-link" href="/gateway/">CAN 网关</a></div>
   <section id="vehicle-panel" aria-label="Tesla 车辆信息">
     <div class="vehicle-head">TESLA <span id="vehicle-ip">IP —</span><span id="vehicle-connection">等待车辆</span></div><div id="vehicle-metrics"></div>
     <div class="vehicle-lights"><div class="vehicle-light-head"><div class="vehicle-label"><svg class="vehicle-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 16c0-3-3-3-3-7a7 7 0 0 1 14 0c0 4-3 4-3 7M8 19h8m-6 3h4"/></svg>氛围灯</div><span>红色 · 3 秒</span></div>
@@ -446,16 +464,221 @@ async function runSpeed(action) { const status = document.getElementById('status
 </script></main></body></html>""".replace('<!-- NAVIGATION_LOG_PANEL -->', NAVIGATION_LOG_PANEL).replace('/* NAVIGATION_LOG_SCRIPT */', NAVIGATION_LOG_SCRIPT).encode()
 
 
+def _gateway_host_allowed(host: str, port: int) -> bool:
+  if not host or host != host.strip():
+    return False
+  try:
+    parsed = urlparse(f"//{host}")
+    if (parsed.username is not None or parsed.password is not None or parsed.path or parsed.query or
+        parsed.fragment or parsed.port != port or parsed.hostname is None):
+      return False
+  except ValueError:
+    return False
+  if parsed.hostname.lower() == "localhost":
+    return True
+  try:
+    address = ipaddress.ip_address(parsed.hostname)
+  except ValueError:
+    return False
+  return address == _TESLA_CONSOLE_ADDRESS or any(address in network for network in _PRIVATE_NETWORKS)
+
+
+def start_gateway_service() -> GatewayConfigService | None:
+  service = None
+  try:
+    service = GatewayConfigService(DEFAULT_STATE_DIR)
+    service.analyzer.start(lambda: service.active)
+    return service
+  except Exception:
+    cloudlog.exception("CAN gateway service initialization failed; keeping device console available")
+    if service is not None:
+      try:
+        service.analyzer.stop()
+      except Exception:
+        pass
+    return None
+
+
+class DeviceConsoleServer(ThreadingHTTPServer):
+  daemon_threads = True
+
+  def __init__(self, server_address, handler_class=None, *, gateway_service=None,
+               max_workers: int = MAX_REQUEST_THREADS):
+    if max_workers < 1:
+      raise ValueError("max_workers must be positive")
+    self.gateway_service = gateway_service
+    self.request_slots = threading.BoundedSemaphore(max_workers)
+    # DeviceConsoleHandler is defined immediately below. Keeping the default
+    # resolution here also makes test handlers injectable without another server.
+    super().__init__(server_address, handler_class or DeviceConsoleHandler)
+
+  def process_request(self, request: socket.socket, client_address) -> None:
+    if not self.request_slots.acquire(blocking=False):
+      self._reject_busy(request)
+      return
+    try:
+      super().process_request(request, client_address)
+    except BaseException:
+      self.request_slots.release()
+      raise
+
+  def process_request_thread(self, request: socket.socket, client_address) -> None:
+    try:
+      super().process_request_thread(request, client_address)
+    finally:
+      self.request_slots.release()
+
+  def _reject_busy(self, request: socket.socket) -> None:
+    body = json.dumps({"ok": False, "error": "服务繁忙，请稍后重试"}, ensure_ascii=False).encode()
+    response = (b"HTTP/1.1 503 Service Unavailable\r\n" +
+                b"Content-Type: application/json; charset=utf-8\r\n" +
+                b"Cache-Control: no-store\r\n" +
+                b"Connection: close\r\n" +
+                f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body)
+    try:
+      request.settimeout(0.1)
+      request_head = b""
+      while b"\r\n\r\n" not in request_head and len(request_head) < MAX_GATEWAY_BODY:
+        chunk = request.recv(min(4096, MAX_GATEWAY_BODY - len(request_head)))
+        if not chunk:
+          return
+        request_head += chunk
+      request.sendall(response)
+    except (ConnectionError, TimeoutError):
+      pass
+    finally:
+      self.shutdown_request(request)
+
+  def handle_error(self, request, client_address) -> None:
+    if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
+      return
+    super().handle_error(request, client_address)
+
+
 class DeviceConsoleHandler(BaseHTTPRequestHandler):
   server_version = "DeviceConsole/1.0"
 
+  def setup(self) -> None:
+    super().setup()
+    self.connection.settimeout(SOCKET_TIMEOUT_S)
+
   def _send(self, status: HTTPStatus, content_type: str, body: bytes) -> None:
-    self.send_response(status)
-    self.send_header("Content-Type", content_type)
-    self.send_header("Content-Length", str(len(body)))
-    self.send_header("Cache-Control", "no-store")
-    self.end_headers()
-    self.wfile.write(body)
+    try:
+      self.send_response(status)
+      self.send_header("Content-Type", content_type)
+      self.send_header("Content-Length", str(len(body)))
+      self.send_header("Cache-Control", "no-store")
+      self.end_headers()
+      self.wfile.write(body)
+    except (ConnectionError, TimeoutError):
+      self.close_connection = True
+
+  def _gateway_authorized(self) -> bool:
+    hosts = self.headers.get_all("Host", [])
+    if len(hosts) != 1 or not _gateway_host_allowed(hosts[0], self.server.server_address[1]):
+      self._json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "网关请求地址不允许"})
+      return False
+    origins = self.headers.get_all("Origin", [])
+    if len(origins) > 1 or (origins and origins[0] != f"http://{hosts[0]}"):
+      self._json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "网关跨站请求不允许"})
+      return False
+    return True
+
+  def _gateway_service(self) -> GatewayConfigService:
+    service = getattr(self.server, "gateway_service", None)
+    if service is None:
+      raise OSError("gateway unavailable")
+    return service
+
+  def _gateway_error(self, error: Exception) -> None:
+    if isinstance(error, ConfigError):
+      self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "网关配置或请求内容无效"})
+    elif isinstance(error, ProtocolError):
+      self._json(HTTPStatus.CONFLICT, {"ok": False, "error": "网关状态已变化，请重新读取"})
+    elif isinstance(error, OSError):
+      self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"ok": False, "error": "网关服务暂不可用"})
+    else:
+      cloudlog.exception("CAN gateway request failed")
+      self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "网关服务内部错误"})
+
+  def _gateway_get(self, path: str, query: dict[str, list[str]]) -> None:
+    try:
+      static = {
+        "/gateway/": ("index.html", "text/html; charset=utf-8"),
+        "/gateway/app.js": ("app.js", "text/javascript; charset=utf-8"),
+        "/gateway/style.css": ("style.css", "text/css; charset=utf-8"),
+      }
+      if path in static:
+        name, content_type = static[path]
+        self._send(HTTPStatus.OK, content_type, (GATEWAY_STATIC / name).read_bytes())
+        return
+      service = self._gateway_service()
+      if path == "/api/gateway/state":
+        with service.lock:
+          self._json(HTTPStatus.OK, service.state())
+        return
+      if path == "/api/gateway/analysis":
+        self._json(HTTPStatus.OK, service.analysis())
+        return
+      if path == "/api/gateway/analysis/frame":
+        if set(query) != {"bus", "id"} or len(query["bus"]) != 1 or len(query["id"]) != 1:
+          raise ConfigError("invalid analysis query")
+        try:
+          bus = int(query["bus"][0])
+          address = int(query["id"][0], 16)
+        except ValueError:
+          raise ConfigError("invalid analysis query") from None
+        if bus not in (0, 1, 2) or not 0 <= address <= 0x7FF:
+          raise ConfigError("invalid analysis query")
+        self._json(HTTPStatus.OK, service.analysis_frame(bus, address))
+        return
+      self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "网关路径不存在"})
+    except (ConnectionError, TimeoutError):
+      pass
+    except Exception as error:
+      self._gateway_error(error)
+
+  def _gateway_json_body(self):
+    if self.headers.get("Transfer-Encoding") is not None:
+      raise ConfigError("chunked requests are not accepted")
+    if self.headers.get_content_type() != "application/json":
+      raise ConfigError("JSON required")
+    lengths = self.headers.get_all("Content-Length", [])
+    if len(lengths) != 1 or not lengths[0].isdigit():
+      raise ConfigError("exactly one Content-Length is required")
+    size = int(lengths[0])
+    if not 0 < size <= MAX_GATEWAY_BODY:
+      raise ConfigError("request size is invalid")
+    body = self.rfile.read(size)
+    if len(body) != size:
+      raise ConfigError("request body is incomplete")
+    try:
+      return json.loads(body)
+    except (UnicodeError, json.JSONDecodeError):
+      raise ConfigError("invalid JSON") from None
+
+  def _gateway_post(self, path: str) -> None:
+    try:
+      service = self._gateway_service()
+      data = self._gateway_json_body()
+      if path == "/api/gateway/validate":
+        config = validate_gateway_config(data)
+        self._json(HTTPStatus.OK, {"config": config, "digest": f"{gateway_digest(config):08X}"})
+        return
+      if path == "/api/gateway/save":
+        with service.lock:
+          self._json(HTTPStatus.OK, service.save(data))
+        return
+      if path == "/api/gateway/analysis/reset":
+        if data != {}:
+          raise ConfigError("reset does not accept parameters")
+        self._json(HTTPStatus.OK, service.reset_analysis())
+        return
+      self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "网关路径不存在"})
+    except (ConnectionError, TimeoutError):
+      pass
+    except Exception as error:
+      self._gateway_error(error)
 
   def _authorize_api(self) -> bool:
     try:
@@ -536,6 +759,12 @@ class DeviceConsoleHandler(BaseHTTPRequestHandler):
     query = parse_qs(request.query, keep_blank_values=True)
     if not client_is_local(self.client_address[0]):
       self._send(HTTPStatus.FORBIDDEN, "text/plain; charset=utf-8", "仅允许本地网络访问".encode())
+      return
+    gateway_route = path in ("/gateway", "/api/gateway") or path.startswith(("/gateway/", "/api/gateway/"))
+    if gateway_route:
+      if not self._gateway_authorized():
+        return
+      self._gateway_get("/gateway/" if path == "/gateway" else path, query)
       return
     if path.startswith("/api/") and not self._authorize_api():
       return
@@ -634,6 +863,13 @@ class DeviceConsoleHandler(BaseHTTPRequestHandler):
 
   def do_POST(self) -> None:
     if not self._authorize_api():
+      return
+    request = urlparse(self.path)
+    path = request.path
+    if path == "/api/gateway" or path.startswith("/api/gateway/"):
+      if not self._gateway_authorized():
+        return
+      self._gateway_post(path)
       return
     if self.path == '/api/navigation/logs/flush':
       try:
@@ -801,8 +1037,20 @@ class DeviceConsoleHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
   start_unknown_can_observer()
-  server = ThreadingHTTPServer((HOST, PORT), DeviceConsoleHandler)
-  server.serve_forever()
+  gateway_service = (start_gateway_service()
+                     if get_hardware_profile() == HardwareProfile.C3XL else None)
+  server = None
+  try:
+    server = DeviceConsoleServer((HOST, PORT), gateway_service=gateway_service)
+    server.serve_forever()
+  finally:
+    if server is not None:
+      server.server_close()
+    if gateway_service is not None:
+      try:
+        gateway_service.analyzer.stop()
+      except Exception:
+        pass
 
 
 if __name__ == "__main__":

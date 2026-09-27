@@ -31,6 +31,11 @@ APP_KEY_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 SOURCE_VALUES = frozenset(("android", "ios", "track"))
 MODE_VALUES = frozenset(("idle", "route_planned", "realtime", "simulation", "arrived", "recalculating"))
 COORDINATE_SYSTEM_VALUES = frozenset(("gcj02", "wgs84", "unknown"))
+ROAD_LAYER_VALUES = frozenset(("unknown", "main", "side"))
+ROUTE_NOTICE_VALUES = frozenset((
+  "none", "restricted_area", "forbidden_area", "road_closed", "congestion", "dispatch", "route_changed",
+  "gps_weak", "unknown",
+))
 MANEUVER_VALUES = frozenset((
   "none", "straight", "slight_left", "slight_right", "turn_left", "turn_right", "sharp_left", "sharp_right",
   "u_turn_left", "u_turn_right", "keep_left", "keep_right", "merge_left", "merge_right", "exit_left",
@@ -55,7 +60,7 @@ LANE_ACTION_BITS = {
 TOP_LEVEL_KEYS = frozenset((
   "schemaVersion", "messageType", "sessionId", "sequence", "routeRevision", "maneuverEventId", "sourcePlatform",
   "sourceWallTimeMs", "validForMs", "navigationMode", "routeActive", "routeMatched", "gpsWeak",
-  "coordinateSystem", "location", "guidance", "lanes",
+  "coordinateSystem", "location", "guidance", "lanes", "laneChangeSpeechCompletedId",
 ))
 LOCATION_KEYS = frozenset((
   "latitude", "longitude", "accuracyM", "bearingDeg", "speedKph", "observedAtMs", "currentStepIndex",
@@ -63,10 +68,11 @@ LOCATION_KEYS = frozenset((
 ))
 GUIDANCE_KEYS = frozenset((
   "maneuver", "maneuverDistanceM", "nextManeuver", "nextManeuverDistanceM", "currentRoad", "nextRoad",
-  "roadClass", "roadType", "advisorySpeedMps", "observedAtMs",
+  "roadClass", "roadType", "advisorySpeedMps", "parallelRoadStatus", "elevatedRoadStatus", "routeNoticeType",
+  "routeNoticeDistanceM", "routeNoticeObservedAtMs", "observedAtMs",
 ))
 LANES_KEYS = frozenset(("observedAtMs", "items"))
-LANE_ITEM_KEYS = frozenset(("index", "allowedActions", "recommendedActions", "recommended"))
+LANE_ITEM_KEYS = frozenset(("index", "allowedActions", "recommendedActions", "recommended", "routeAvoid"))
 
 
 class NavAssistProtocolError(ValueError):
@@ -81,6 +87,7 @@ class LaneGuidance:
   allowed_actions: int
   recommended_actions: int
   recommended: bool
+  route_avoid: bool
 
 
 @dataclass(frozen=True)
@@ -118,9 +125,15 @@ class NavAssistSnapshot:
   road_type: int
   current_road: str
   next_road: str
+  parallel_road_status: str
+  elevated_road_status: str
+  route_notice_type: str
+  route_notice_distance_m: float
+  route_notice_observed_at_ms: int
   lane_guidance_present: bool
   lane_guidance_observed_at_ms: int
   lanes: tuple[LaneGuidance, ...]
+  lane_change_speech_completed_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -259,6 +272,9 @@ def parse_snapshot(body: bytes) -> NavAssistSnapshot:
   except (UnicodeDecodeError, json.JSONDecodeError) as error:
     _reject("malformed", f"invalid JSON: {error}")
   top = _object(raw, "snapshot", TOP_LEVEL_KEYS)
+  speech_id = _string(top, "laneChangeSpeechCompletedId", max_length=32) if "laneChangeSpeechCompletedId" in top else ""
+  if speech_id and re.fullmatch(r"[0-9a-f]{32}", speech_id) is None:
+    _reject("malformed", "invalid laneChangeSpeechCompletedId")
 
   if _integer(top, "schemaVersion", 0, 1_000) != SCHEMA_VERSION:
     _reject("malformed", "unsupported schemaVersion")
@@ -293,6 +309,7 @@ def parse_snapshot(body: bytes) -> NavAssistSnapshot:
         _required(lane, "recommendedActions"), f"lanes.items[{position}].recommendedActions",
       ),
       recommended=_boolean(lane, "recommended"),
+      route_avoid=_optional_boolean(lane, "routeAvoid"),
     ))
 
   advisory_speed = guidance.get("advisorySpeedMps")
@@ -313,6 +330,7 @@ def parse_snapshot(body: bytes) -> NavAssistSnapshot:
 
   return NavAssistSnapshot(
     session_id=session_id,
+    lane_change_speech_completed_id=speech_id,
     sequence=_integer(top, "sequence", 1, 2**63 - 1),
     route_revision=_integer(top, "routeRevision", 0, 2**63 - 1),
     maneuver_event_id=_integer(top, "maneuverEventId", 0, 2**63 - 1),
@@ -345,6 +363,11 @@ def parse_snapshot(body: bytes) -> NavAssistSnapshot:
     road_type=_documented_road_type(guidance),
     current_road=_optional_road_name(guidance, "currentRoad"),
     next_road=_optional_road_name(guidance, "nextRoad"),
+    parallel_road_status=_enum(guidance, "parallelRoadStatus", ROAD_LAYER_VALUES, default="unknown"),
+    elevated_road_status=_enum(guidance, "elevatedRoadStatus", ROAD_LAYER_VALUES, default="unknown"),
+    route_notice_type=_enum(guidance, "routeNoticeType", ROUTE_NOTICE_VALUES, default="none"),
+    route_notice_distance_m=float(_optional_integer(guidance, "routeNoticeDistanceM", 0, 100_000, default=0)),
+    route_notice_observed_at_ms=_optional_integer(guidance, "routeNoticeObservedAtMs", 0, 2**63 - 1, default=0),
     lane_guidance_present=lane_guidance_present,
     lane_guidance_observed_at_ms=lane_observed_at_ms,
     lanes=tuple(lanes),

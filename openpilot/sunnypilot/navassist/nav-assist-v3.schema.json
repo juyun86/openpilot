@@ -43,7 +43,8 @@
     "coordinateSystem": { "enum": ["gcj02", "wgs84", "unknown"] },
     "location": { "$ref": "#/$defs/location" },
     "guidance": { "$ref": "#/$defs/guidance" },
-    "lanes": { "$ref": "#/$defs/lanes" }
+    "lanes": { "$ref": "#/$defs/lanes" },
+    "laneChangeSpeechCompletedId": { "type": "string", "pattern": "^([0-9a-f]{32})?$", "maxLength": 32 }
   },
   "$defs": {
     "maneuver": {
@@ -118,7 +119,17 @@
         "roadType": {
           "enum": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 53, 56, 58]
         },
-        "advisorySpeedMps": { "type": "number", "exclusiveMinimum": 0, "maximum": 60 }
+        "advisorySpeedMps": { "type": "number", "exclusiveMinimum": 0, "maximum": 60 },
+        "parallelRoadStatus": { "enum": ["unknown", "main", "side"] },
+        "elevatedRoadStatus": { "enum": ["unknown", "main", "side"] },
+        "routeNoticeType": {
+          "enum": [
+            "none", "restricted_area", "forbidden_area", "road_closed", "congestion", "dispatch",
+            "route_changed", "gps_weak", "unknown"
+          ]
+        },
+        "routeNoticeDistanceM": { "type": "integer", "minimum": 0, "maximum": 100000 },
+        "routeNoticeObservedAtMs": { "type": "integer", "minimum": 0 }
       }
     },
     "lanes": {
@@ -147,6 +158,7 @@
           "maxItems": 16
         },
         "recommended": { "type": "boolean" },
+        "routeAvoid": { "type": "boolean" },
         "recommendedActions": {
           "type": "array",
           "items": { "$ref": "#/$defs/laneAction" },

@@ -292,13 +292,19 @@ class TestLoggerd(OpenpilotTestCase):
         assert recv_cnt == expected_cnt, f"expected {expected_cnt} msgs for {s}, got {recv_cnt}"
 
   @pytest.mark.skipif(get_hardware_profile() != HardwareProfile.C3XL, reason="C3XL-specific logging policy")
-  def test_c3xl_creates_qlog_without_rlog(self):
-    self._publish_random_messages(["deviceState"])
+  def test_c3xl_records_full_can_and_sendcan(self):
+    sent = self._publish_random_messages(["can", "sendcan"])
 
     segment = self._get_latest_log_dir()
     assert (segment / "qlog.zst").is_file()
-    assert not (segment / "rlog.zst").exists()
+    assert (segment / "rlog.zst").is_file()
     self._check_sentinel(list(LogReader(str(segment / "qlog.zst"))), True)
+    full = list(LogReader(str(segment / "rlog.zst")))
+    self._check_sentinel(full, True)
+    for service in ("can", "sendcan"):
+      received = [message for message in full if message.which() == service]
+      assert len(received) == len(sent[service])
+      assert [message.to_dict() for message in received] == [message.to_dict() for message in sent[service]]
 
   @pytest.mark.skipif(get_hardware_profile() != HardwareProfile.C3XL, reason="C3XL-specific logging policy")
   def test_c3xl_diverts_local_feature_messages_out_of_qlog(self):
@@ -322,7 +328,6 @@ class TestLoggerd(OpenpilotTestCase):
     }
     assert diagnostic_services == set(services)
 
-  @pytest.mark.skipif(get_hardware_profile() == HardwareProfile.C3XL, reason="C3XL intentionally disables rlog")
   def test_rlog(self):
     services = random.sample(CEREAL_SERVICES, random.randint(5, 10))
     sent_msgs = self._publish_random_messages(services)

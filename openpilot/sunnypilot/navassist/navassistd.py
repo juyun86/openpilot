@@ -11,6 +11,8 @@ from openpilot.common.realtime import Ratekeeper
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.navassist.discovery import DISCOVERY_HOST, DISCOVERY_PORT, NavAssistDiscoveryServer
 from openpilot.sunnypilot.navassist.identity import NavAssistDeviceIdentity, NavAssistPairingStore
+from openpilot.sunnypilot.navassist.oem_lane_feedback import OemLaneFeedback
+from openpilot.sunnypilot.navassist.oem_navigation_feedback import OemNavigationFeedback
 from openpilot.sunnypilot.navassist.protocol import NavAssistStore
 from openpilot.sunnypilot.navassist.publisher import build_nav_assist_message
 from openpilot.sunnypilot.navassist.server import NavAssistHTTPServer
@@ -26,6 +28,23 @@ LOCALIZATION_MAX_AGE_NS = 500_000_000
 LOCAL_POSITION_MAX_STD_M = 10.0
 REPLAY_CHECKPOINT_PATH = "/dev/shm/navassist_replay_state.json"
 MAINTENANCE_REFRESH_NS = 1_000_000_000
+
+
+def pending_lane_announcement(intent, *, healthy: bool, now_ns: int, model_state: int) -> dict:
+  if (not healthy or not intent.valid or not intent.signalRequested or intent.spLaneChangeReady
+      or intent.targetLaneIndex < 0 or model_state not in (0, 1)
+      or not 0 <= now_ns - intent.publishMonoTime <= 200_000_000
+      or len(intent.announcementId) != 32 or str(intent.direction) not in ("left", "right")):
+    return {}
+  return {'id': str(intent.announcementId), 'sessionId': str(intent.sessionId), 'direction': str(intent.direction)}
+
+
+def current_lane_decision(intent, *, healthy: bool, now_ns: int) -> dict:
+  if (not healthy or not intent.valid or not intent.sessionId
+      or not 0 <= now_ns - intent.publishMonoTime <= 200_000_000):
+    return {}
+  return {'sessionId': str(intent.sessionId), 'reason': str(intent.reason),
+          'signalRequested': bool(intent.signalRequested), 'direction': str(intent.direction)}
 
 
 def local_position_std_m(location) -> float:
@@ -58,8 +77,17 @@ def main() -> None:
   pairing = NavAssistPairingStore(params)
 
   store = NavAssistStore(checkpoint_path=REPLAY_CHECKPOINT_PATH)
+  oem_lane_feedback = OemLaneFeedback()
+  oem_navigation_feedback = OemNavigationFeedback()
+  speech_feedback = {}
+  lane_decision = {}
   server = NavAssistHTTPServer((LISTEN_HOST, LISTEN_PORT), store, identity, pairing)
-  udp_server = NavAssistUDPServer((LISTEN_HOST, UDP_SNAPSHOT_PORT), store)
+  udp_server = NavAssistUDPServer(
+    (LISTEN_HOST, UDP_SNAPSHOT_PORT), store, ack_payload_provider=oem_lane_feedback.snapshot,
+    telemetry_provider=oem_navigation_feedback.snapshot,
+    lane_decision_provider=lambda: lane_decision,
+    announcement_provider=lambda: speech_feedback,
+  )
   try:
     discovery_server = NavAssistDiscoveryServer(
       (DISCOVERY_HOST, DISCOVERY_PORT), identity, pairing, is_offroad=lambda: params.get_bool("IsOffroad"),
@@ -89,12 +117,42 @@ def main() -> None:
     )
 
     pm = messaging.PubMaster(["navAssistStateSP"])
-    sm = messaging.SubMaster(["liveLocationKalman"])
+    sm = messaging.SubMaster(["liveLocationKalman", "carState", "carControl", "radarState", "modelV2", "navLaneIntentSP"])
+    can_sock = messaging.sub_sock("can", conflate=False)
     ratekeeper = Ratekeeper(PUBLISH_HZ)
     next_maintenance_ns = 0
     while True:
       sm.update(0)
+      for event in messaging.drain_sock(can_sock):
+        oem_lane_feedback.ingest(event.can, now_ns=int(event.logMonoTime), received_ns=time.monotonic_ns())
+        oem_navigation_feedback.ingest(
+          event.can, now_ns=int(event.logMonoTime), received_ns=time.monotonic_ns(), valid=bool(event.valid),
+        )
       now_ns = time.monotonic_ns()
+      car_valid = all(sm.seen[name] and sm.alive[name] and sm.valid[name] for name in ("carState", "carControl", "modelV2"))
+      radar_valid = bool(sm.seen["radarState"] and sm.alive["radarState"] and sm.valid["radarState"])
+      car_state = sm["carState"]
+      lead = sm["radarState"].leadOne
+      model_meta = sm["modelV2"].meta
+      speech_feedback = pending_lane_announcement(
+        sm['navLaneIntentSP'], now_ns=now_ns, model_state=int(model_meta.laneChangeState.raw),
+        healthy=bool(car_valid and sm['carControl'].latActive and sm.seen['navLaneIntentSP']
+                     and sm.alive['navLaneIntentSP'] and sm.valid['navLaneIntentSP']),
+      )
+      lane_decision = current_lane_decision(
+        sm['navLaneIntentSP'], now_ns=now_ns,
+        healthy=bool(sm.seen['navLaneIntentSP'] and sm.alive['navLaneIntentSP']
+                     and sm.valid['navLaneIntentSP']),
+      )
+      oem_lane_feedback.update_vehicle(
+        now_ns=now_ns, vehicle_valid=car_valid, radar_valid=radar_valid, blindspot_valid=car_valid,
+        left_blindspot=bool(car_state.leftBlindspot), right_blindspot=bool(car_state.rightBlindspot),
+        ego_speed_mps=float(car_state.vEgo), lateral_active=bool(sm["carControl"].latActive),
+        brake_pressed=bool(car_state.brakePressed), gas_pressed=bool(car_state.gasPressed),
+        lane_change_state=int(model_meta.laneChangeState.raw), lane_change_direction=int(model_meta.laneChangeDirection.raw),
+        lead_present=bool(lead.present), lead_distance_m=float(lead.dRel), lead_speed_mps=float(lead.vLead),
+        lead_relative_speed_mps=float(lead.vRel),
+      )
       if now_ns >= next_maintenance_ns:
         if params.get_bool("NavAssistPairingReset"):
           pairing.reset()

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#07101a">
+  <title>C3 CAN 分析</title>
+  <link rel="stylesheet" href="/gateway/style.css?v=20260916-12">
+  <script src="/gateway/app.js?v=20260916-12" defer></script>
+</head>
+<body><main>
+  <a class="console-back" href="/">← 返回 C3 主控制台</a>
+  <header><div><p class="eyebrow">C3 · CAN GATEWAY</p><h1 id="page-title">实时分析</h1><p id="page-subtitle">验证白名单报文是否已转发到 C3</p></div><span id="badge" class="badge">正在连接</span></header>
+  <section id="analysis-page">
+    <aside id="analysis-notice">正在读取实时 CAN。</aside>
+    <section class="overview card"><h2>白名单概览</h2><div class="metric"><span>分析模式</span><strong id="audit-status">逐条验证</strong></div><div class="metric"><span>验证位置</span><strong id="global-no-go">C3 CAN1 网关输出</strong></div><div class="metric"><span>在线 / 白名单 ID</span><strong id="fresh-count">0 / 0</strong></div></section>
+    <section class="analyzer-toolbar card"><input id="frame-filter" type="search" placeholder="搜索 CAN ID 或报文名"><button id="pause-analysis">暂停</button><button id="clear-analysis">清空页面统计</button></section>
+    <p id="visible-count" class="visible-count">等待发现报文</p>
+    <section id="frame-cards" class="frame-list"></section>
+  </section>
+  <section id="config-page" hidden>
+    <aside id="notice">正在读取网关状态。</aside>
+    <section class="summary card"><div><small>传输方向</small><strong>CAN2 / CAN3 / CAN4 → CAN1</strong></div><div><small>配置摘要</small><strong id="digest">等待读取</strong></div><div><small>规则数量</small><strong id="count">—</strong></div></section>
+    <section class="editor card"><div class="toolbar"><h2>转发规则</h2><div><button id="reload">重新读取</button><button id="import">导入 JSON</button><button id="export">导出 JSON</button></div></div><p class="hint">CAN2：车辆 CAN1 · CAN3：CAN-CH · CAN4：预留监听。反向控制规则固定保留。</p><div class="table-wrap"><table><thead><tr><th>启用</th><th>来源</th><th>标准 CAN ID</th><th>报文含义</th><th>DLC</th><th></th></tr></thead><tbody id="rules"></tbody></table></div><button id="add" class="add">＋ 添加转发规则</button><div class="bottom"><span id="dirty">尚未读取</span><div><button id="rollback">载入上一版</button><button id="save" class="primary">保存到网关</button></div></div></section>
+    <p id="message" role="status" aria-live="polite"></p>
+  </section>
+  <footer>实时分析只读检查当前白名单报文，不发送车辆控制指令；新增或删除规则后会自动同步显示。</footer>
+  <input type="file" id="file" accept="application/json,.json" hidden><dialog id="review"><h2>确认配置变更</h2><p>确认后将写入网关并立即回读校验。</p><pre id="changes"></pre><div class="dialog-actions"><button id="cancel">返回编辑</button><button id="confirm" class="primary">确认保存</button></div></dialog>
+</main><nav class="bottom-nav"><button class="nav-item active" data-page="analysis"><span>⇄</span>实时分析</button><button class="nav-item" data-page="config"><span>☷</span>白名单</button></nav></body></html>

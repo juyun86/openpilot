@@ -18,8 +18,8 @@ from openpilot.sunnypilot.navassist.settings import NavAssistSettings
 NAVIGATION_ONLY_SERVICES = frozenset(('navAssistStateSP', 'navLaneIntentSP', 'laneTopologyStateSP'))
 LOG_PATTERN = re.compile(r'^navdiag-(\d{13})-(\d{13})-([0-9a-f]{8})\.jsonl\.gz$')
 PARTIAL_PATTERN = re.compile(r'^navdiag-\d{13}-[0-9a-f]{8}\.partial$')
-MAX_LOG_BYTES = 128 * 1024 * 1024
-MAX_FILES = 180
+MAX_LOG_BYTES = 2 * 1024 * 1024 * 1024
+MAX_FILES = 1200
 MAX_FILE_SECONDS = 60
 
 

@@ -40,8 +40,24 @@ def helper():
   desire = DesireHelper()
   desire.alc.update_params = lambda: None
   desire.alc.lane_change_set_timer = AutoLaneChangeMode.NUDGELESS
+  # Keep tests independent of the device's persisted post-block delay option.
+  desire.alc.lane_change_bsm_delay = False
   desire.lane_turn_controller.update_params = lambda: None
   return desire
+
+
+@pytest.mark.parametrize("bsm_delay", [False, True])
+def test_navigation_gate_recovery_does_not_restart_blindspot_delay(bsm_delay):
+  desire = helper()
+  desire.alc.lane_change_bsm_delay = bsm_delay
+  desire.update(car_state(), True, 1.0, nav_lane_intent=intent())
+  for _ in range(10):
+    desire.update(car_state(leftBlinker=True), True, 1.0, nav_lane_intent=intent())
+  desire.update(car_state(leftBlinker=True), True, 1.0, nav_lane_intent=intent(), left_crossing_allowed=True)
+  assert desire.lane_change_state == LaneChangeState.laneChangeStarting
+  for _ in range(25):
+    desire.update(car_state(leftBlinker=True), True, 1.0, nav_lane_intent=intent(), left_crossing_allowed=True)
+  assert desire.lane_change_state == LaneChangeState.laneChangeStarting
 
 
 def test_navigation_signal_enters_pre_lane_change_but_waits_for_sp_crossing_gate():
@@ -55,6 +71,17 @@ def test_navigation_signal_enters_pre_lane_change_but_waits_for_sp_crossing_gate
 
   desire.update(car_state(leftBlinker=True), True, 1.0, nav_lane_intent=intent(),
                 left_crossing_allowed=True)
+  assert desire.lane_change_state == LaneChangeState.laneChangeStarting
+
+
+def test_accelerator_does_not_cancel_navigation_change_after_start():
+  desire = helper()
+  desire.update(car_state(), True, 1.0, nav_lane_intent=intent(), left_crossing_allowed=True)
+  for _ in range(4):
+    desire.update(car_state(leftBlinker=True), True, 1.0, nav_lane_intent=intent(), left_crossing_allowed=True)
+  assert desire.lane_change_state == LaneChangeState.laneChangeStarting
+  desire.update(car_state(leftBlinker=True, gasPressed=True), True, 1.0,
+                nav_lane_intent=intent(), left_crossing_allowed=True)
   assert desire.lane_change_state == LaneChangeState.laneChangeStarting
 
 
@@ -190,6 +217,10 @@ def test_completed_lane_change_tail_transfers_to_same_direction_turn(direction):
   assert desire.lane_change_state == LaneChangeState.laneChangeStarting
 
   for _ in range(15):
+    desire.update(car_state(**lamp_on), True, 0.0, nav_lane_intent=lane_target, **crossing_allowed)
+  assert desire.lane_change_state == LaneChangeState.laneChangeFinishing
+  assert desire.lane_change_direction == getattr(LaneChangeDirection, direction)
+  for _ in range(20):
     desire.update(car_state(**lamp_on), True, 0.0, nav_lane_intent=lane_target, **crossing_allowed)
   assert desire.lane_change_state == LaneChangeState.preLaneChange
 

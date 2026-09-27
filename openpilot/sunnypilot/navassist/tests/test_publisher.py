@@ -27,6 +27,11 @@ def test_fresh_snapshot_maps_to_typed_cereal_without_control_commands():
   assert state.sourceAgeMs == 100.0
   assert state.advisorySpeedValid and state.advisorySpeedMps == 5.0
   assert state.lanes[0].recommended
+  assert not state.lanes[0].routeAvoid
+  assert state.parallelRoadStatus == "main"
+  assert state.elevatedRoadStatus == "side"
+  assert state.routeNoticeType == "roadClosed"
+  assert state.routeNoticeDistanceM == 350.0
   assert state.rejectReason == "none"
 
 
@@ -39,6 +44,7 @@ def test_local_expiry_fails_closed_while_retaining_diagnostics():
   assert not state.valid and state.stale
   assert state.sessionId == "session-a"
   assert state.rejectReason == "stale"
+  assert len(state.lanes) == 0
 
 
 def test_local_localization_is_diagnostic_only_for_fresh_matched_phone_guidance():
@@ -110,12 +116,48 @@ def test_phone_location_quality_is_diagnostic_only_for_fresh_matched_guidance():
   assert state.valid and state.rejectReason == "phoneLocalization"
 
 
-def test_stale_lane_guidance_is_hidden_without_disabling_longitudinal_guidance():
+def test_unchanged_lane_event_is_held_by_fresh_snapshots_without_refreshing_observation_time():
   raw = payload()
-  raw["lanes"]["observedAtMs"] = raw["sourceWallTimeMs"] - 2_001
-  stale_lanes = AcceptedSnapshot(parse_snapshot(encode(raw)), 1_000_000_000, 1_500_000_000)
-  state = build_nav_assist_message(
-    stale_lanes, 1_100_000_000, local_localization_valid=True,
-  ).navAssistStateSP
+  observed_at_ms = raw["lanes"]["observedAtMs"]
+  for sequence, age_ms in enumerate((0, 2_001, 8_052, 45_000), start=1):
+    raw["sequence"] = sequence
+    raw["sourceWallTimeMs"] = observed_at_ms + age_ms
+    receive_ns = 1_000_000_000 + age_ms * 1_000_000
+    current = AcceptedSnapshot(parse_snapshot(encode(raw)), receive_ns, receive_ns + 500_000_000)
+    state = build_nav_assist_message(current, receive_ns + 100_000_000, local_localization_valid=True).navAssistStateSP
+    assert state.valid and not state.stale and state.sourceAgeMs == 100.0
+    assert len(state.lanes) == 1 and state.lanes[0].recommended
+    assert state.lanes[0].recommendedActions == current.snapshot.lanes[0].recommended_actions
+    assert state.laneGuidanceObservedAtMs == observed_at_ms
+
+
+def test_absent_or_empty_lane_block_clears_previously_published_lanes():
+  for absence in ("missing", "empty"):
+    assert len(build_nav_assist_message(accepted(), 1_100_000_000).navAssistStateSP.lanes) == 1
+    raw = payload(sequence=2)
+    if absence == "missing":
+      raw.pop("lanes")
+    else:
+      raw["lanes"]["items"] = []
+    current = AcceptedSnapshot(parse_snapshot(encode(raw)), 1_100_000_000, 1_600_000_000)
+    state = build_nav_assist_message(current, 1_200_000_000, local_localization_valid=True).navAssistStateSP
+    assert state.valid and len(state.lanes) == 0
+
+
+def test_future_lane_observation_is_hidden_without_disabling_longitudinal_guidance():
+  raw = payload()
+  raw["lanes"]["observedAtMs"] = raw["sourceWallTimeMs"] + 1
+  current = AcceptedSnapshot(parse_snapshot(encode(raw)), 1_000_000_000, 1_500_000_000)
+  state = build_nav_assist_message(current, 1_100_000_000, local_localization_valid=True).navAssistStateSP
   assert state.valid and len(state.lanes) == 0
   assert state.laneGuidanceObservedAtMs == raw["lanes"]["observedAtMs"]
+
+
+def test_new_route_without_lane_block_does_not_reuse_previous_route_lanes():
+  first = build_nav_assist_message(accepted(), 1_100_000_000).navAssistStateSP
+  assert len(first.lanes) == 1
+  raw = payload(sequence=2, route_revision=2)
+  raw.pop("lanes")
+  current = AcceptedSnapshot(parse_snapshot(encode(raw)), 1_100_000_000, 1_600_000_000)
+  state = build_nav_assist_message(current, 1_200_000_000, local_localization_valid=True).navAssistStateSP
+  assert state.valid and state.routeRevision == 2 and len(state.lanes) == 0

@@ -22,9 +22,14 @@ MANEUVER_TO_CEREAL = {
   "ramp_left": "rampLeft", "ramp_right": "rampRight", "roundabout": "roundabout", "destination": "destination",
   "unknown": "unknown",
 }
+ROUTE_NOTICE_TO_CEREAL = {
+  "none": "none", "restricted_area": "restrictedArea", "forbidden_area": "forbiddenArea",
+  "road_closed": "roadClosed", "congestion": "congestion", "dispatch": "dispatch",
+  "route_changed": "routeChanged", "gps_weak": "gpsWeak", "unknown": "unknown",
+}
 
 MAX_PHONE_LOCATION_AGE_MS = 1_000
-MAX_PHONE_LANE_GUIDANCE_AGE_MS = 2_000
+MAX_ROUTE_NOTICE_AGE_MS = 30_000
 MAX_PHONE_LOCATION_ACCURACY_M = 25.0
 
 
@@ -57,6 +62,7 @@ def build_nav_assist_message(current: AcceptedSnapshot | None, now_ns: int, *, l
   state.routeRevision = snapshot.route_revision
   state.maneuverEventId = snapshot.maneuver_event_id
   state.sessionId = snapshot.session_id
+  state.laneChangeSpeechCompletedId = "" if stale else snapshot.lane_change_speech_completed_id
   state.source = SOURCE_TO_CEREAL[snapshot.source_platform]
   state.mode = MODE_TO_CEREAL[snapshot.navigation_mode]
   state.coordinateSystem = COORDINATE_TO_CEREAL[snapshot.coordinate_system]
@@ -84,11 +90,22 @@ def build_nav_assist_message(current: AcceptedSnapshot | None, now_ns: int, *, l
   state.roadType = snapshot.road_type
   state.currentRoad = snapshot.current_road
   state.nextRoad = snapshot.next_road
+  state.parallelRoadStatus = snapshot.parallel_road_status
+  state.elevatedRoadStatus = snapshot.elevated_road_status
+  route_notice_age_ms = snapshot.source_wall_time_ms - snapshot.route_notice_observed_at_ms
+  route_notice_valid = bool(
+    snapshot.route_notice_observed_at_ms > 0 and 0 <= route_notice_age_ms <= MAX_ROUTE_NOTICE_AGE_MS
+  )
+  state.routeNoticeType = ROUTE_NOTICE_TO_CEREAL[snapshot.route_notice_type if route_notice_valid else "none"]
+  state.routeNoticeDistanceM = snapshot.route_notice_distance_m if route_notice_valid else 0.0
+  state.routeNoticeObservedAtMs = snapshot.route_notice_observed_at_ms
   state.laneGuidanceObservedAtMs = snapshot.lane_guidance_observed_at_ms
   state.sourceAgeMs = current.age_ms(now_ns)
   lane_guidance_age_ms = snapshot.source_wall_time_ms - snapshot.lane_guidance_observed_at_ms
+  # AMap lane guidance is held between show/hide events. Each full snapshot
+  # carries the current lanes; its transport TTL owns liveness, not callback age.
   lane_guidance_valid = bool(
-    snapshot.lane_guidance_present and 0 <= lane_guidance_age_ms <= MAX_PHONE_LANE_GUIDANCE_AGE_MS
+    not stale and snapshot.lane_guidance_present and lane_guidance_age_ms >= 0
   )
   lanes = state.init("lanes", len(snapshot.lanes) if lane_guidance_valid else 0)
   for target, source in zip(lanes, snapshot.lanes if lane_guidance_valid else (), strict=True):
@@ -96,6 +113,7 @@ def build_nav_assist_message(current: AcceptedSnapshot | None, now_ns: int, *, l
     target.allowedActions = source.allowed_actions
     target.recommendedActions = source.recommended_actions
     target.recommended = source.recommended
+    target.routeAvoid = source.route_avoid
 
   phone_observations_valid = _phone_observations_valid(snapshot)
   control_source_valid = snapshot.source_platform in ("android", "ios") and snapshot.navigation_mode == "realtime"

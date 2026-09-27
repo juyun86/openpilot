@@ -259,6 +259,8 @@ def hardware_thread(end_event, hw_queue) -> None:
   uptime_offroad: float = params.get("UptimeOffroad", return_default=True)
   uptime_onroad: float = params.get("UptimeOnroad", return_default=True)
   last_uptime_ts: float = time.monotonic()
+  last_network_metered: bool | None = None
+  last_runner_voltage: bool | None = None
 
   HARDWARE.initialize_hardware()
   thermal_config = HARDWARE.get_thermal_config()
@@ -472,7 +474,10 @@ def hardware_thread(end_event, hw_queue) -> None:
 
     # GitHub runner auto off: 9V is used as the threshold because most desktop runners
     # will rarely exceed 5V so 9V is set as our buffer between desk use and car use.
-    params.put_bool("GithubRunnerSufficientVoltage", ((voltage or 0) and voltage > 9000))
+    runner_voltage = bool(voltage and voltage > 9000)
+    if runner_voltage != last_runner_voltage:
+      params.put_bool("GithubRunnerSufficientVoltage", runner_voltage)
+      last_runner_voltage = runner_voltage
 
     power_monitor.calculate(voltage, onroad_conditions["ignition"])
     msg.deviceState.offroadPowerUsageUwh = power_monitor.get_power_used()
@@ -542,7 +547,9 @@ def hardware_thread(end_event, hw_queue) -> None:
         except Exception:
           cloudlog.exception("failed to save offroad status")
 
-    params.put_bool("NetworkMetered", msg.deviceState.networkMetered)
+    if msg.deviceState.networkMetered != last_network_metered:
+      params.put_bool("NetworkMetered", msg.deviceState.networkMetered)
+      last_network_metered = msg.deviceState.networkMetered
 
     now_ts = time.monotonic()
     if off_ts:
@@ -552,8 +559,10 @@ def hardware_thread(end_event, hw_queue) -> None:
     last_uptime_ts = now_ts
 
     if (count % int(60. / DT_HW)) == 0:
-      params.put("UptimeOffroad", uptime_offroad, block=True)
-      params.put("UptimeOnroad", uptime_onroad, block=True)
+      # Accounting must not hold up deviceState when another parameter writer
+      # is waiting for the filesystem journal while holding the Params lock.
+      params.put("UptimeOffroad", uptime_offroad)
+      params.put("UptimeOnroad", uptime_onroad)
 
     count += 1
     should_start_prev = should_start

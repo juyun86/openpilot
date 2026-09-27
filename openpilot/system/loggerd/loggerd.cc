@@ -15,7 +15,7 @@
 ExitHandler do_exit;
 
 struct LoggerdState {
-  LoggerState logger{Path::log_root(), !sunnypilot::hardware::is_c3xl()};
+  LoggerState logger{Path::log_root()};
   std::atomic<double> last_camera_seen_tms{0.0};
   std::atomic<int> ready_to_rotate{0};  // count of encoders ready to rotate
   int max_waiting = 0;

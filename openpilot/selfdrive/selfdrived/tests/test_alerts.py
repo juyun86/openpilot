@@ -2,6 +2,7 @@ import copy
 import json
 import os
 import random
+from types import SimpleNamespace
 
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.cereal import log
@@ -9,7 +10,7 @@ from opendbc.car.structs import car
 from openpilot.cereal.messaging import SubMaster
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.params import Params
-from openpilot.selfdrive.selfdrived.events import Alert, EVENTS, ET
+from openpilot.selfdrive.selfdrived.events import Alert, EVENTS, ET, process_not_running_alert
 from openpilot.selfdrive.selfdrived.alertmanager import set_offroad_alert
 from openpilot.selfdrive.test.process_replay.process_replay import CONFIGS
 
@@ -69,6 +70,17 @@ class TestAlerts(OpenpilotTestCase):
 
         if event_type not in (ET.WARNING, ET.PERMANENT, ET.PRE_ENABLE):
           assert a.creation_delay == 0.
+
+  def test_process_not_running_alert_omits_ignored_processes(self):
+    manager_state = SimpleNamespace(processes=[
+      SimpleNamespace(name='device_console', running=False, shouldBeRunning=True),
+      SimpleNamespace(name='controlsd', running=False, shouldBeRunning=True),
+    ])
+    sm = {'managerState': manager_state}
+
+    alert = process_not_running_alert(self.CP, self.CS, sm, False, 0, None)
+
+    assert alert.alert_text_2 == 'controlsd'
 
   def test_offroad_alerts(self):
     params = Params()

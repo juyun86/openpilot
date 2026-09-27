@@ -26,8 +26,8 @@ from openpilot.sunnypilot.hardware.profile import HardwareProfile, get_hardware_
 
 
 def apply_local_recording_policy(params: Params) -> None:
-  """C3XL records structured route logs but never continuous road video."""
-  if get_hardware_profile() == HardwareProfile.C3XL:
+  """Default C3XL video off, while preserving an explicit recording choice."""
+  if get_hardware_profile() == HardwareProfile.C3XL and params.get("RecordRoadVideo") is None:
     params.put_bool("RecordRoadVideo", False, block=True)
 
 

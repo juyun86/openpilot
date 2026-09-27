@@ -1,4 +1,5 @@
 import os
+from types import SimpleNamespace
 from unittest.mock import Mock, call
 
 import pytest
@@ -12,6 +13,8 @@ from openpilot.sunnypilot.hardware.profile import HardwareProfile
 def beepd():
   beep = Beepd.__new__(Beepd)
   beep.mads_enabled = None
+  beep.lane_change_initialized = False
+  beep.lane_change_beep_request_id = 0
   beep.dispatch_beep = Mock()
   return beep
 
@@ -29,6 +32,30 @@ def test_mads_enable_and_disable_have_distinct_beeps(beepd):
   beepd.update_mads(False)
 
   assert beepd.dispatch_beep.call_args_list == [call(beepd.engage), call(beepd.disengage)]
+
+
+def test_lane_change_buzzer_fires_once_when_each_automatic_change_starts(beepd):
+  def intent(request_id, ready=False, valid=True):
+    return SimpleNamespace(valid=valid, spLaneChangeReady=ready, requestId=request_id)
+
+  beepd.update_lane_change(intent(4), enabled=True)
+  beepd.update_lane_change(intent(4, ready=True), enabled=True)
+  beepd.update_lane_change(intent(4, ready=True), enabled=True)
+  beepd.update_lane_change(intent(4), enabled=True)
+  beepd.update_lane_change(intent(5, ready=True), enabled=True)
+
+  assert beepd.dispatch_beep.call_args_list == [call(beepd.engage), call(beepd.engage)]
+
+
+def test_lane_change_buzzer_is_silent_on_initial_active_or_disabled_state(beepd):
+  active = SimpleNamespace(valid=True, spLaneChangeReady=True, requestId=9)
+  beepd.update_lane_change(active, enabled=True)
+  disabled = SimpleNamespace(valid=True, spLaneChangeReady=True, requestId=10)
+  beepd.update_lane_change(disabled, enabled=False)
+  beepd.update_lane_change(disabled, enabled=True)
+  beepd.update_lane_change(SimpleNamespace(valid=False, spLaneChangeReady=True, requestId=11), enabled=True)
+
+  beepd.dispatch_beep.assert_not_called()
 
 
 def test_warning_and_prompt_repeat_follow_legacy_beep_rules(beepd, monkeypatch):

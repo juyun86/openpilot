@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from importlib import import_module
 
 import pytest
 
@@ -6,6 +7,13 @@ from openpilot.cereal import custom
 from opendbc.sunnypilot.car.tesla.values import TeslaFlagsSP
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.sunnypilot.navassist.speed_controller import MIN_TARGET_SPEED_MPS, NavigationSpeedController
+from openpilot.sunnypilot.navassist.settings import NavAssistSettings, SettingsCache
+
+
+@pytest.fixture(autouse=True)
+def isolated_navigation_settings(monkeypatch):
+  # Unit tests must not depend on the vehicle owner's saved speed/settings.
+  monkeypatch.setattr(SettingsCache, 'read', lambda self: NavAssistSettings())
 
 
 class FakeSM(dict):
@@ -49,11 +57,42 @@ def test_disabled_controller_is_exactly_transparent_without_nav_service_state():
   assert not controller.is_active
 
 
+@pytest.mark.parametrize('road_class', [0, 6])
+@pytest.mark.parametrize('maneuver', [custom.NavAssistStateSP.Maneuver.slightLeft, custom.NavAssistStateSP.Maneuver.slightRight])
+def test_highway_branch_does_not_invent_a_28kph_turn_target(road_class, maneuver):
+  guidance = nav(maneuver=maneuver); guidance.roadClass = road_class
+  assert NavigationSpeedController._target_for(guidance) is None
+  guidance.advisorySpeedValid = True; guidance.advisorySpeedMps = 18.
+  assert NavigationSpeedController._target_for(guidance) == 18.
+  guidance.advisorySpeedMps = float('nan')
+  assert NavigationSpeedController._target_for(guidance) is None
+  guidance.roadClass = 1; guidance.advisorySpeedValid = False
+  assert NavigationSpeedController._target_for(guidance) == 8.
+
+
 def test_controller_defaults_to_automatic_activation_when_navigation_is_valid():
   controller = NavigationSpeedController()
   update(controller, FakeSM(nav(distance=100.0)))
   assert controller.enabled
   assert controller.event_admitted
+
+
+@pytest.mark.parametrize('road_class', [0, 6, 7, 8])
+@pytest.mark.parametrize('maneuver', [custom.NavAssistStateSP.Maneuver.rampLeft, custom.NavAssistStateSP.Maneuver.rampRight,
+                                    custom.NavAssistStateSP.Maneuver.exitLeft, custom.NavAssistStateSP.Maneuver.exitRight])
+def test_ramp_and_exit_do_not_invent_a_fixed_speed_from_maneuver_name(road_class, maneuver):
+  guidance = nav(maneuver=maneuver, distance=300.)
+  guidance.roadClass = road_class
+  controller = NavigationSpeedController()
+  update(controller, FakeSM(guidance), v_ego=25., v_cruise=30.)
+  assert not controller.is_active
+  assert controller.output_v_target == V_CRUISE_UNSET
+  guidance.advisorySpeedValid = True
+  guidance.advisorySpeedMps = 18.
+  assert NavigationSpeedController._target_for(guidance) == 18.
+  for invalid in (0., -1., float('nan'), float('inf')):
+    guidance.advisorySpeedMps = invalid
+    assert NavigationSpeedController._target_for(guidance) is None
 
 
 def test_early_event_is_admitted_then_activates_inside_comfort_window():
@@ -122,22 +161,54 @@ def test_late_event_is_rejected_for_its_full_lifetime():
   assert controller.event_rejected and controller.output_v_target == V_CRUISE_UNSET
 
 
-def test_source_loss_or_driver_override_cancels_and_latches_event():
+@pytest.mark.parametrize('source_gap_ns', [500_000_000, 3_700_000_000])
+def test_short_source_loss_rechecks_and_resumes_feasible_active_turn(monkeypatch, source_gap_ns):
+  clock = [1_000_000_000]
+  monkeypatch.setattr(import_module(NavigationSpeedController.__module__).time, 'monotonic_ns', lambda: clock[0])
   controller = NavigationSpeedController(enabled=True)
   update(controller, FakeSM(nav(distance=100.0)))
   update(controller, FakeSM(nav(distance=60.0)))
   assert controller.is_active
 
   update(controller, FakeSM(nav(distance=55.0), healthy=False))
-  assert not controller.is_active and controller.is_releasing and controller.event_rejected
+  assert not controller.is_active and controller.is_releasing and not controller.event_rejected
   released_target = controller.output_v_target
 
+  clock[0] += source_gap_ns
   update(controller, FakeSM(nav(distance=50.0)))
-  assert not controller.is_active
-  assert controller.output_v_target > released_target
+  assert controller.is_active and not controller.event_rejected
+  assert controller.output_v_target <= released_target
 
   next_event = FakeSM(nav(distance=100.0, event_id=2))
   update(controller, next_event, override=True)
+  assert not controller.is_active
+
+
+@pytest.mark.parametrize('late,expired,driver', [(True, False, False), (False, True, False), (False, False, True)])
+def test_source_recovery_still_rejects_late_expired_or_driver_interrupted_turn(monkeypatch, late, expired, driver):
+  clock = [1_000_000_000]
+  monkeypatch.setattr(import_module(NavigationSpeedController.__module__).time, 'monotonic_ns', lambda: clock[0])
+  controller = NavigationSpeedController(enabled=True)
+  update(controller, FakeSM(nav(distance=100.0)))
+  update(controller, FakeSM(nav(distance=60.0)))
+  update(controller, FakeSM(nav(distance=55.0), healthy=False))
+  clock[0] += 4_000_000_001 if expired else 500_000_000
+  update(controller, FakeSM(nav(distance=10.0 if late else 50.0), gas=driver))
+  assert controller.event_rejected and not controller.is_active
+  update(controller, FakeSM(nav(distance=45.0)))
+  assert controller.event_rejected and not controller.is_active
+
+
+def test_recovered_source_can_admit_new_event(monkeypatch):
+  clock = [1_000_000_000]
+  monkeypatch.setattr(import_module(NavigationSpeedController.__module__).time, 'monotonic_ns', lambda: clock[0])
+  controller = NavigationSpeedController(enabled=True)
+  update(controller, FakeSM(nav(distance=100.0)))
+  update(controller, FakeSM(nav(distance=60.0)))
+  update(controller, FakeSM(nav(distance=55.0), healthy=False))
+  clock[0] += 500_000_000
+  update(controller, FakeSM(nav(distance=100.0, event_id=2)))
+  assert controller.event_admitted and not controller.event_activated and not controller.event_rejected
   assert not controller.is_active
 
 

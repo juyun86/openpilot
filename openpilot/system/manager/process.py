@@ -179,6 +179,26 @@ class PythonProcess(ManagerProcess):
     self.shutting_down = False
 
 
+class RestartingPythonProcess(PythonProcess):
+  """Manager-owned Python process that restarts after an isolated crash."""
+  def __init__(self, name, module, should_run, enabled=True, sigkill=False, restart_delay=5.0):
+    super().__init__(name, module, should_run, enabled=enabled, sigkill=sigkill)
+    self.restart_delay = restart_delay
+    self.next_restart_time = 0.0
+
+  def start(self) -> None:
+    if self.proc is not None and self.proc.exitcode is not None:
+      if time.monotonic() < self.next_restart_time:
+        return
+      cloudlog.error(f"restarting optional process {self.name} (exitcode {self.proc.exitcode})")
+      self.stop()
+
+    previous_proc = self.proc
+    super().start()
+    if self.proc is not None and self.proc is not previous_proc:
+      self.next_restart_time = time.monotonic() + self.restart_delay
+
+
 class DaemonProcess(ManagerProcess):
   """Python process that has to stay running across manager restart.
   This is used for athena so you don't lose SSH access when restarting manager."""

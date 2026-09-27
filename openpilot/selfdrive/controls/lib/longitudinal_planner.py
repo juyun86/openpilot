@@ -36,8 +36,27 @@ def get_coast_accel(pitch):
   return np.sin(pitch) * -5.65 - 0.3  # fitted from data using xx/projects/allow_throttle/compute_coast_accel.py
 
 def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, angle_steers, CP, dt, accel_coast, allow_throttle,
-                     max_accel_override=None):
+                     max_accel_override=None, model_curvature=None, a_target_prev=None):
   max_accel = ACCEL_MAX if e2e else get_max_accel(v_ego)
+
+  if e2e and getattr(CP, 'brand', None) == 'tesla':
+    # E2E bypasses the ACC-only acceleration limit below. Keep an independent
+    # cruise candidate for the curve actually being driven/requested, using
+    # the existing lateral-acceleration envelope, not navigation permission.
+    measured_curvature = angle_steers * CV.DEG_TO_RAD / (CP.steerRatio * CP.wheelbase)
+    curvatures = [abs(c) for c in (measured_curvature, model_curvature)
+                  if c is not None and math.isfinite(c)]
+    curvature = max(curvatures, default=0.)
+    if curvature > 0.:
+      a_total_max = np.interp(v_ego, _A_TOTAL_MAX_BP, _A_TOTAL_MAX_V)
+      curve_speed = math.sqrt(a_total_max / curvature)
+      if curve_speed < v_cruise:
+        v_cruise = curve_speed
+        # The unselected cruise candidate can be far above the acceleration
+        # actually requested by E2E. Start its curve response from the applied
+        # planner target, otherwise jerk limiting delays it by several seconds.
+        if a_target_prev is not None and math.isfinite(a_target_prev):
+          a_cruise_prev = min(a_cruise_prev, a_target_prev)
 
   if not e2e:
     a_total_max = np.interp(v_ego, _A_TOTAL_MAX_BP, _A_TOTAL_MAX_V)
@@ -77,6 +96,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.j_desired_trajectory = np.zeros(CONTROL_N)
 
   def update(self, sm):
+    previous_output_accel = self.output_a_target
     LongitudinalPlannerSP.update(self, sm)
 
     if len(sm['carControl'].orientationNED) == 3:
@@ -108,6 +128,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       self.v_desired_filter.x = v_ego
       self.output_a_target = np.clip(sm['carState'].aEgo, ACCEL_MIN, ACCEL_MAX)
       self.a_cruise = self.output_a_target
+      previous_output_accel = self.output_a_target
 
     # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
@@ -147,7 +168,11 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
 
     self.a_cruise = get_cruise_accel(is_e2e, v_cruise, v_ego,
                                      self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
-                                     accel_coast, self.allow_throttle)
+                                     accel_coast, self.allow_throttle,
+                                     model_curvature=(sm['modelV2'].action.desiredCurvature
+                                                      if sm.seen['modelV2'] and sm.alive['modelV2'] and sm.valid['modelV2']
+                                                      else None),
+                                     a_target_prev=previous_output_accel)
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
 
     candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),

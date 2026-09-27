@@ -177,6 +177,16 @@ def navigation_display_from_service(
   if bool(nav.stale) or reject_reason in ("stale", "guidanceStale"):
     return NavigationOverlayDisplay("导航已过期", "等待手机更新路线", "当前没有有效指引", receiving=True, warning=True)
   if not bool(nav.routeActive):
+    inactive_mode_labels = {
+      "realtime": ("手机导航中", "C3 暂无有效导航指引"),
+      "recalculating": ("手机正在重新规划", "等待手机更新路线"),
+      "simulation": ("手机模拟导航中", "模拟路线不用于车辆联动"),
+      "routePlanned": ("手机路线已规划", "请在手机上开始导航"),
+      "arrived": ("手机导航已到达", "可在手机上选择新目的地"),
+    }
+    labels = inactive_mode_labels.get(str(getattr(nav, "mode", "idle")))
+    if labels is not None:
+      return NavigationOverlayDisplay(*labels, "手机已连接", receiving=True)
     return NavigationOverlayDisplay("等待开始导航", "在手机上选择目的地", "手机已连接", receiving=True)
   if not bool(nav.routeMatched):
     return NavigationOverlayDisplay("正在匹配路线", "等待手机更新路线", "暂不显示转向指引", receiving=True, warning=True)
@@ -212,7 +222,7 @@ def navigation_display_from_service(
     elif str(getattr(lane_intent, "reason", "")) == "neighborObservationHold":
       details.append("确认邻车道 · 暂停变道")
     elif getattr(lane_intent, "forkNow", False):
-      details.append(f"{direction}分叉请求 · 实线放行")
+      details.append(f"{direction}分叉请求" + (" · 实线放行" if getattr(lane_intent, "ignoreSolidBoundary", False) else ""))
     elif getattr(lane_intent, "spLaneChangeReady", False):
       details.append(f"请求向{direction}变道")
     else:

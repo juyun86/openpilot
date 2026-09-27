@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from openpilot.sunnypilot.navassist.lane_intent import (
   LaneIntentDirection,
   LaneTopologyInput,
@@ -24,8 +26,43 @@ def vehicle(*, bsm_left=False, bsm_right=False, state=ObservedLaneChangeState.of
                           lane_change_direction=direction)
 
 
-def turn_plan(*, valid=True, maneuver="turnLeft", distance=100.0, session="session-a", revision=1, event=11):
-  return NavTurnPlan(valid, session, revision, event, maneuver, distance)
+def turn_plan(*, valid=True, maneuver="turnLeft", distance=100.0, session="session-a", revision=1, event=11,
+              source_interrupted=False):
+  return NavTurnPlan(valid, session, revision, event, maneuver, distance, source_interrupted)
+
+
+def test_source_zero_event_keeps_existing_lamp_identity_until_source_recovers():
+  coordinator = NavTurnSignalCoordinator()
+  started = coordinator.update(turn_plan(distance=38), speed_mps=4.5, now_ns=0)
+  for now in (100_000_000, 1_600_000_000, 3_900_000_000):
+    held = coordinator.update(turn_plan(valid=False, event=0, distance=17, source_interrupted=True),
+                              speed_mps=0.3, now_ns=now)
+    assert held.signal_requested and held.request_id == started.request_id == 11
+    assert held.direction == LaneIntentDirection.left and held.target_lane_index == -1
+    assert not held.lane_change_ready
+  recovered = coordinator.update(turn_plan(distance=17), speed_mps=0.3, now_ns=4_000_000_000)
+  assert recovered.signal_requested and recovered.request_id == 11
+
+
+def test_source_zero_event_cannot_start_a_lamp_and_expires_without_fresh_source():
+  gap = turn_plan(valid=False, event=0, source_interrupted=True)
+  coordinator = NavTurnSignalCoordinator()
+  assert not coordinator.update(gap, speed_mps=10, now_ns=0).signal_requested
+  coordinator.update(turn_plan(), speed_mps=10, now_ns=1)
+  coordinator.update(gap, speed_mps=10, now_ns=100)
+  expired = coordinator.update(gap, speed_mps=10, now_ns=101 + coordinator.SOURCE_GAP_GRACE_NS)
+  assert not expired.signal_requested
+  assert not coordinator.update(gap, speed_mps=10, now_ns=102 + coordinator.SOURCE_GAP_GRACE_NS).signal_requested
+
+
+def test_source_hold_does_not_mask_stop_route_or_direction_changes():
+  for gap in (turn_plan(valid=False, event=0),
+              turn_plan(valid=False, event=0, source_interrupted=True, revision=2),
+              turn_plan(valid=False, event=0, source_interrupted=True, session="new-session"),
+              turn_plan(valid=False, event=0, source_interrupted=True, maneuver="turnRight")):
+    coordinator = NavTurnSignalCoordinator()
+    coordinator.update(turn_plan(), speed_mps=10, now_ns=0)
+    assert not coordinator.update(gap, speed_mps=10, now_ns=1, turn_geometry_active=True).signal_requested
 
 
 def test_navigation_turn_signal_starts_before_turn_without_a_lane_target():
@@ -193,33 +230,50 @@ def test_navigation_turn_signal_drops_after_the_bounded_plan_gap_grace():
   assert not expired.signal_requested and expired.reason == "turnUnavailable"
 
 
-def test_signal_waits_at_solid_line_then_authorizes_after_dashed_is_stable():
+def test_navigation_signals_at_solid_line_then_authorizes_on_dashed_and_physical_lamp():
   coordinator = NavLaneIntentCoordinator()
   first_mismatch = coordinator.update(plan(), topology(), vehicle(), now_ns=0)
   assert not first_mismatch.signal_requested and not first_mismatch.lane_change_ready
   assert first_mismatch.reason == "stabilizingLaneAlignment"
   waiting = coordinator.update(plan(), topology(), vehicle(), now_ns=500_000_000)
-  assert not waiting.signal_requested and waiting.reason == "waitingCrossing"
+  assert waiting.signal_requested and not waiting.lane_change_ready and waiting.reason == "signaling"
   first_dashed = coordinator.update(plan(), topology(left_cross=True), vehicle(left_blinker=True), now_ns=600_000_000)
-  assert first_dashed.signal_requested and not first_dashed.lane_change_ready
+  assert first_dashed.signal_requested and first_dashed.lane_change_ready
   authorized = coordinator.update(plan(), topology(left_cross=True), vehicle(left_blinker=True), now_ns=900_000_000)
   assert authorized.signal_requested and authorized.lane_change_ready
   assert authorized.direction == LaneIntentDirection.left
 
 
-def test_blindspot_delays_physical_signal_until_the_lane_change_can_start():
+def test_observation_recovery_uses_existing_alignment_wait():
+  coordinator = NavLaneIntentCoordinator()
+  current = plan()
+  observed = topology(left_cross=True)
+  coordinator.update(current, observed, vehicle(), now_ns=0)
+  coordinator.update(current, observed, vehicle(), now_ns=500_000_000)
+  assert coordinator.update(current, observed, vehicle(left_blinker=True), now_ns=600_000_000).lane_change_ready
+  missing = replace(observed, valid_for_control=False)
+  coordinator.update(current, missing, vehicle(left_blinker=True), now_ns=1_600_000_000)
+  paused = coordinator.update(current, missing, vehicle(left_blinker=True), now_ns=2_650_000_000)
+  assert paused.reason == 'neighborObservationPaused' and not paused.signal_requested
+  coordinator.update(current, observed, vehicle(), now_ns=2_700_000_000)
+  resumed = coordinator.update(current, observed, vehicle(), now_ns=3_200_000_000)
+  assert resumed.signal_requested and not resumed.lane_change_ready
+  assert coordinator.update(current, observed, vehicle(left_blinker=True), now_ns=3_250_000_000).lane_change_ready
+
+
+def test_blindspot_allows_intent_signal_but_delays_lane_change_readiness():
   coordinator = NavLaneIntentCoordinator()
   coordinator.update(plan(recommended=(2,)), topology(right_cross=True), vehicle(), now_ns=0)
   coordinator.update(plan(recommended=(2,)), topology(right_cross=True),
                      vehicle(bsm_right=True, right_blinker=True), now_ns=500_000_000)
   blocked = coordinator.update(plan(recommended=(2,)), topology(right_cross=True),
                                vehicle(bsm_right=True, right_blinker=True), now_ns=900_000_000)
-  assert not blocked.signal_requested and blocked.reason == "waitingBlindspot"
+  assert blocked.signal_requested and not blocked.lane_change_ready and blocked.reason == "signaling"
 
   signaling = coordinator.update(
     plan(recommended=(2,)), topology(right_cross=True), vehicle(right_blinker=True), now_ns=1_000_000_000,
   )
-  assert signaling.signal_requested and not signaling.lane_change_ready
+  assert signaling.signal_requested and signaling.lane_change_ready
 
 
 def test_software_signal_request_never_authorizes_without_physical_blinker_feedback():
@@ -266,7 +320,7 @@ def test_one_lane_change_completes_before_another_request_is_considered():
   assert not complete.signal_requested and complete.reason == "laneChangeComplete"
 
 
-def test_relative_extreme_lane_change_uses_sp_cycle_when_visual_index_recenters():
+def test_relative_extreme_lane_change_ends_unconfirmed_when_visual_index_recenters():
   coordinator = NavLaneIntentCoordinator()
   heuristic = NavLanePlan(True, "session-a", 1, 7, 3, (0,), heuristic=True)
   coordinator.update(heuristic, topology(ego=1, left_cross=True), vehicle(), now_ns=0)
@@ -290,8 +344,169 @@ def test_relative_extreme_lane_change_uses_sp_cycle_when_visual_index_recenters(
     now_ns=2_000_000_000,
   )
 
-  assert completing.signal_requested
-  assert not completed.signal_requested and completed.reason == "laneChangeObserved"
+  assert not completing.signal_requested and completing.reason == "laneChangeCompletionUnconfirmed"
+  assert not completed.signal_requested and completed.reason == "laneChangeCompletionUnconfirmed"
+  assert coordinator._relative_consistency._completed_changes == 0
+
+
+def relative_change_started(direction):
+  coordinator = NavLaneIntentCoordinator()
+  left = direction == LaneIntentDirection.left
+  current_plan = NavLanePlan(True, "session-a", 1, 7, 3, (0 if left else 2,),
+                             heuristic=True, edge_direction=direction)
+  observed = topology(ego=1, left_cross=True, right_cross=True)
+  car = replace(vehicle(left_blinker=left), right_blinker=not left, speed_mps=25.0)
+  for now_ns in (1_000_000_000, 1_600_000_000, 2_200_000_000, 2_600_000_000):
+    intent = coordinator.update(current_plan, observed, car, now_ns=now_ns)
+  assert intent.lane_change_ready
+  starting = replace(car, lane_change_state=ObservedLaneChangeState.starting, lane_change_direction=direction)
+  coordinator.update(current_plan, observed, starting, now_ns=2_700_000_000)
+  return coordinator, current_plan, observed, starting
+
+
+def test_relative_cycle_cannot_prove_completion_even_when_local_index_changes():
+  for direction in (LaneIntentDirection.left, LaneIntentDirection.right):
+    for state in (ObservedLaneChangeState.pre, ObservedLaneChangeState.off):
+      for ego_index in (0, 1, 2):
+        coordinator, current_plan, observed, car = relative_change_started(direction)
+        ended = replace(car, lane_change_state=state)
+        local = replace(observed, ego_lane_index=ego_index)
+        waiting = coordinator.update(current_plan, local, ended, now_ns=3_300_000_000)
+        assert not waiting.signal_requested and waiting.reason == "laneChangeCompletionUnconfirmed"
+        result = coordinator.update(current_plan, local, ended, now_ns=3_900_000_000)
+        assert result.reason == "laneChangeCompletionUnconfirmed"
+        assert not result.signal_requested and not result.lane_change_ready
+        assert coordinator._relative_consistency._completed_changes == 0
+
+
+def test_terminal_relative_event_survives_invalid_inputs_and_revision_changes():
+  for direction in (LaneIntentDirection.left, LaneIntentDirection.right):
+    for cancelled in (False, True):
+      coordinator, current_plan, observed, car = relative_change_started(direction)
+      if cancelled:
+        ended = replace(car, lane_change_state=ObservedLaneChangeState.finishing,
+                        lane_change_direction=LaneIntentDirection.none)
+        expected = "laneChangeCancelled"
+      else:
+        ended = replace(car, lane_change_state=ObservedLaneChangeState.pre)
+        expected = "laneChangeCompletionUnconfirmed"
+      for now_ns in (3_300_000_000, 3_900_000_000):
+        result = coordinator.update(current_plan, observed, ended, now_ns=now_ns)
+      assert result.reason == expected
+      idle_car = replace(car, left_blinker=False, right_blinker=False,
+                         lane_change_state=ObservedLaneChangeState.off, lane_change_direction=LaneIntentDirection.none)
+      gaps = (
+        replace(current_plan, valid=False, maneuver_event_id=0),
+        replace(current_plan, valid=False, session_id="", route_revision=0, maneuver_event_id=0),
+        replace(current_plan, valid=False, session_id="other", maneuver_event_id=99),
+        replace(current_plan, valid=True, maneuver_event_id=0),
+        replace(current_plan, valid=True, session_id=""),
+        replace(current_plan, route_revision=2),
+        current_plan,
+      )
+      for index, gap in enumerate(gaps):
+        result = coordinator.update(gap, observed, idle_car, now_ns=(5 + index) * 1_000_000_000)
+        assert result.reason == expected
+        assert not result.signal_requested and not result.lane_change_ready
+      assert coordinator._relative_consistency._completed_changes == 0
+
+
+def test_terminal_relative_event_releases_for_valid_new_maneuver_or_session():
+  for cancelled in (False, True):
+    for new_session in (False, True):
+      coordinator, current_plan, observed, car = relative_change_started(LaneIntentDirection.left)
+      ended = replace(car, lane_change_state=ObservedLaneChangeState.finishing if cancelled else ObservedLaneChangeState.pre,
+                      lane_change_direction=LaneIntentDirection.none if cancelled else LaneIntentDirection.left)
+      for now_ns in (3_300_000_000, 3_900_000_000):
+        coordinator.update(current_plan, observed, ended, now_ns=now_ns)
+      fresh = replace(current_plan, session_id="session-b") if new_session else replace(current_plan, maneuver_event_id=8)
+      car = replace(car, lane_change_state=ObservedLaneChangeState.off, lane_change_direction=LaneIntentDirection.none)
+      for now_ns in (5_000_000_000, 5_600_000_000, 6_200_000_000, 6_600_000_000):
+        result = coordinator.update(fresh, observed, car, now_ns=now_ns)
+      assert result.signal_requested and result.lane_change_ready
+
+
+def test_relative_completion_wait_resets_on_model_cycle_or_observation_gap():
+  for gap_is_topology in (False, True):
+    coordinator, current_plan, observed, car = relative_change_started(LaneIntentDirection.left)
+    ended = replace(car, lane_change_state=ObservedLaneChangeState.pre)
+    gap = coordinator.update(current_plan, replace(observed, valid_for_control=False) if gap_is_topology else observed,
+                             car, now_ns=3_600_000_000)
+    if gap_is_topology:
+      assert gap.signal_requested and gap.lane_change_ready
+    result = coordinator.update(current_plan, observed, ended, now_ns=3_900_000_000)
+    assert result.reason == "laneChangeCompletionUnconfirmed"
+
+
+def test_execution_abort_cannot_restart_same_event_after_recovery():
+  for direction in (LaneIntentDirection.left, LaneIntentDirection.right):
+    for fault in ("navigation", "brake", "lateral", "lamp", "timeout", "topology"):
+      coordinator, current_plan, observed, car = relative_change_started(direction)
+      bad_plan = replace(current_plan, valid=False, maneuver_event_id=0) if fault == "navigation" else current_plan
+      bad_lane = replace(observed, valid_for_control=False) if fault == "topology" else observed
+      bad_car = replace(car, brake_pressed=fault == "brake",
+                        lateral_active=fault != "lateral")
+      if fault == "lamp":
+        bad_car = replace(bad_car, left_blinker=False, right_blinker=False)
+      now_ns = 13_000_000_000 if fault == "timeout" else 3_000_000_000
+      result = coordinator.update(bad_plan, bad_lane, bad_car, now_ns=now_ns)
+      if fault == "topology":
+        assert result.signal_requested and result.reason == "heuristicTopologyTransition"
+        now_ns = 13_000_000_000
+        result = coordinator.update(bad_plan, bad_lane, bad_car, now_ns=now_ns)
+      assert not result.signal_requested
+      ended = replace(car, lane_change_state=ObservedLaneChangeState.off, lane_change_direction=LaneIntentDirection.none)
+      for index in range(1, 8):
+        result = coordinator.update(current_plan, observed, ended, now_ns=now_ns + index * 600_000_000)
+        assert result.reason == "laneChangeCompletionUnconfirmed"
+        assert not result.signal_requested and not result.lane_change_ready
+      assert coordinator._relative_consistency._completed_changes == 0
+
+
+def test_invalid_topology_does_not_hide_opposite_model_direction():
+  coordinator, current_plan, observed, car = relative_change_started(LaneIntentDirection.left)
+  opposite = replace(car, lane_change_direction=LaneIntentDirection.right)
+  result = coordinator.update(current_plan, replace(observed, valid_for_control=False), opposite,
+                              now_ns=3_000_000_000)
+  assert result.reason == 'directionMismatch'
+  assert not result.signal_requested and not result.lane_change_ready
+
+
+def test_accelerator_and_highway_speed_do_not_cancel_navigation_lane_change():
+  coordinator, plan, topology, car = relative_change_started(LaneIntentDirection.left)
+  car = replace(car, gas_pressed=True, speed_mps=35.)
+  result = coordinator.update(plan, topology, car, now_ns=3_000_000_000)
+  assert result.signal_requested and result.lane_change_ready
+
+
+def test_navigation_signal_can_wait_for_crossing_permission_then_become_ready():
+  coordinator = NavLaneIntentCoordinator()
+  plan = NavLanePlan(True, 'route', 1, 17, 3, (0,))
+  denied = LaneTopologyInput(True, 3, 1, True, True, False, True)
+  car = LaneVehicleInput(True, 25.)
+  coordinator.update(plan, denied, car, now_ns=1_000_000_000)
+  waiting = coordinator.update(plan, denied, car, now_ns=1_500_000_000)
+  assert waiting.signal_requested and not waiting.lane_change_ready
+  car = replace(car, left_blinker=True)
+  assert not coordinator.update(plan, denied, car, now_ns=1_600_000_000).lane_change_ready
+  allowed = replace(denied, left_crossing_allowed=True)
+  coordinator.update(plan, allowed, car, now_ns=1_700_000_000)
+  ready = coordinator.update(plan, allowed, car, now_ns=2_100_000_000)
+  assert ready.signal_requested and ready.lane_change_ready
+
+
+def test_prestart_observation_recovery_does_not_gain_execution_failure_lock():
+  coordinator, current_plan, observed, car = relative_change_started(LaneIntentDirection.left)
+  # Build a separate coordinator that has only reached the start-ready phase.
+  coordinator = NavLaneIntentCoordinator()
+  car = replace(car, lane_change_state=ObservedLaneChangeState.off, lane_change_direction=LaneIntentDirection.none)
+  for stamp in (1_000_000_000, 1_600_000_000, 2_200_000_000, 2_600_000_000):
+    result = coordinator.update(current_plan, observed, car, now_ns=stamp)
+  assert result.lane_change_ready
+  coordinator.update(replace(current_plan, valid=False), observed, car, now_ns=3_000_000_000)
+  for stamp in (4_000_000_000, 4_600_000_000, 5_200_000_000, 5_600_000_000):
+    result = coordinator.update(current_plan, observed, car, now_ns=stamp)
+  assert result.lane_change_ready
 
 
 def test_wrong_observed_lane_change_direction_aborts_and_latches_event():
@@ -339,15 +554,21 @@ def test_expected_source_pair_transition_during_lane_change_has_bounded_grace():
     now_ns=1_000_000_000,
   )
   assert transition.signal_requested and transition.reason == "topologyTransition"
+  prolonged = coordinator.update(
+    plan(recommended=(0,)), topology(ego=-1, valid=False),
+    vehicle(state=ObservedLaneChangeState.starting, direction=LaneIntentDirection.left, left_blinker=True),
+    now_ns=3_700_000_000,
+  )
+  assert prolonged.signal_requested and prolonged.reason == "topologyTransition"
   coordinator.update(
     plan(recommended=(0,)), topology(ego=1, left_cross=True),
     vehicle(state=ObservedLaneChangeState.pre, direction=LaneIntentDirection.left, left_blinker=True),
-    now_ns=1_200_000_000,
+    now_ns=3_900_000_000,
   )
   observed = coordinator.update(
     plan(recommended=(0,)), topology(ego=1, left_cross=True),
     vehicle(state=ObservedLaneChangeState.pre, direction=LaneIntentDirection.left, left_blinker=True),
-    now_ns=1_700_000_000,
+    now_ns=4_400_000_000,
   )
   assert not observed.signal_requested and observed.reason == "laneChangeObserved"
 

@@ -8,6 +8,7 @@ from opendbc.car.structs import car
 import openpilot.cereal.messaging as messaging
 from openpilot.common.realtime import Ratekeeper
 from openpilot.sunnypilot.hardware.profile import HardwareProfile, get_hardware_profile
+from openpilot.sunnypilot.navassist.settings import SettingsCache
 
 AudibleAlert = car.CarControl.HUDControl.AudibleAlert
 BEEP_PULSE_SECONDS = 0.010
@@ -19,6 +20,9 @@ class Beepd:
   def __init__(self):
     self.current_alert = AudibleAlert.none
     self.mads_enabled = None
+    self.lane_change_initialized = False
+    self.lane_change_beep_request_id = 0
+    self.settings_cache = SettingsCache()
     # timestamp until which promptRepeat should be suppressed
     self.prompt_suppress_until = 0
     self.beep_lock = threading.Lock()
@@ -133,6 +137,11 @@ class Beepd:
     if sm.updated['selfdriveStateSP']:
       self.update_mads(bool(sm['selfdriveStateSP'].mads.enabled))
 
+    if sm.updated['navLaneIntentSP']:
+      self.update_lane_change(
+        sm['navLaneIntentSP'], enabled=self.settings_cache.read().lane_change_buzzer_enabled,
+      )
+
   def update_mads(self, enabled):
     if self.mads_enabled is None:
       self.mads_enabled = enabled
@@ -141,6 +150,19 @@ class Beepd:
     if enabled != self.mads_enabled:
       self.mads_enabled = enabled
       self.dispatch_beep(self.engage if enabled else self.disengage)
+
+  def update_lane_change(self, intent, *, enabled):
+    ready = bool(intent.valid and intent.spLaneChangeReady)
+    request_id = int(intent.requestId)
+    if not self.lane_change_initialized:
+      self.lane_change_initialized = True
+      if ready:
+        self.lane_change_beep_request_id = request_id
+      return
+    if ready and request_id > 0 and request_id != self.lane_change_beep_request_id:
+      self.lane_change_beep_request_id = request_id
+      if enabled:
+        self.dispatch_beep(self.engage)
 
   def test_beepd_thread(self):
     frame = 0
@@ -167,7 +189,7 @@ class Beepd:
     if test:
       threading.Thread(target=self.test_beepd_thread, daemon=True).start()
 
-    sm = messaging.SubMaster(['selfdriveState', 'selfdriveStateSP'])
+    sm = messaging.SubMaster(['selfdriveState', 'selfdriveStateSP', 'navLaneIntentSP'])
     rk = Ratekeeper(20)
 
     while True:

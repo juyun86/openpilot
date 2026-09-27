@@ -6,10 +6,13 @@ adding Tesla branches throughout generic card.
 """
 
 import hashlib
+import math
 import time
 from typing import Any
 
 from opendbc.sunnypilot.car.tesla.values import TeslaSafetyFlagsSP
+from opendbc.sunnypilot.car.tesla.ars408.transmitter import MOTION_MAX_AGE_NS
+from openpilot.selfdrive.locationd.helpers import PoseCalibrator
 from openpilot.sunnypilot.selfdrive.car.tesla.ambient_lighting import AmbientLightingController
 from openpilot.sunnypilot.selfdrive.car.tesla.validation_controller import TeslaTurnSignalRealtimeController
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode
@@ -24,7 +27,45 @@ NAV_SIGNAL_SESSION_TIMEOUT_NS = 60_000_000_000
 NAV_SIGNAL_RETRY_NS = 500_000_000
 LIGHTING_STALE_NS = 2_000_000_000
 LIGHTING_MESSAGE = "ID3F5VCFRONT_lighting"
-CONTEXT_SERVICES = ("selfdriveStateSP", "modelV2", "navLaneIntentSP")
+CONTEXT_SERVICES = ("selfdriveStateSP", "modelV2", "navLaneIntentSP", "deviceMotion", "extrinsicsCalibration")
+RADAR_CALIBRATION_MAX_AGE_NS = 2_000_000_000
+
+
+def radar_yaw_rate_context(sm, now_ns: int, calibrator: PoseCalibrator, cache: dict | None = None) -> tuple[float | None, int]:
+  for service, max_age in (("deviceMotion", MOTION_MAX_AGE_NS), ("extrinsicsCalibration", RADAR_CALIBRATION_MAX_AGE_NS)):
+    if (not sm.seen[service] or not sm.valid[service] or sm.logMonoTime[service] <= 0 or
+        not 0 <= now_ns - sm.logMonoTime[service] <= max_age):
+      return None, 0
+
+  motion = sm["deviceMotion"]
+  calibration = sm["extrinsicsCalibration"]
+  angular = motion.angularVelocityDevice
+  rpy = tuple(calibration.rpyCalib)
+  xyz = (angular.x, angular.y, angular.z)
+  if (not (motion.inputsOK and motion.sensorsOK and motion.posenetOK and angular.valid) or
+      motion.timestamp <= 0 or not 0 <= now_ns - motion.timestamp <= MOTION_MAX_AGE_NS or
+      len(rpy) != 3 or not all(math.isfinite(v) for v in rpy) or
+      not all(math.isfinite(v) for v in xyz)):
+    return None, 0
+
+  # Check freshness/health above even when returning a cached measurement.
+  calibration_key = (sm.logMonoTime["extrinsicsCalibration"], rpy, str(calibration.calStatus))
+  if cache is None or cache.get("calibration_key") != calibration_key:
+    calibrator.feed_extrinsics_calibration(calibration)
+    if cache is not None:
+      cache["calibration_key"] = calibration_key
+  if not calibrator.calib_valid:
+    return None, 0
+  motion_key = (calibration_key, sm.logMonoTime["deviceMotion"], motion.timestamp, xyz)
+  if cache is not None and cache.get("motion_key") == motion_key:
+    return cache["result"]
+  # Only the calibrated angular z component is needed, not a complete Pose
+  # or its velocity/acceleration/orientation/covariance transformations.
+  yaw_rate = float(calibrator.calib_from_device[2] @ xyz)
+  result = (yaw_rate, min(motion.timestamp, sm.logMonoTime["deviceMotion"])) if math.isfinite(yaw_rate) else (None, 0)
+  if cache is not None:
+    cache.update(motion_key=motion_key, result=result)
+  return result
 
 
 def longitudinal_context(sm, now: float) -> tuple[int, bool, bool, float, bool, bool, bool, float, bool, float, bool]:
@@ -71,6 +112,9 @@ class TeslaCardAdapter:
     self.enabled = brand == "tesla"
     self.car_interface = car_interface
     self.sm = submaster
+    self.radar_transmitter = getattr(getattr(car_interface, "CC", None), "ars408_transmitter", None) if self.enabled else None
+    self.radar_pose_calibrator = PoseCalibrator() if self.radar_transmitter is not None and self.radar_transmitter.enabled else None
+    self.radar_yaw_cache: dict = {}
     self.traffic_control_observer = TeslaTrafficControlObserver() if self.enabled else None
     self.road_context_parser = self._create_road_context_parser() if self.enabled else None
     self.lighting_parser = self._create_lighting_parser() if self.enabled else None
@@ -185,12 +229,11 @@ class TeslaCardAdapter:
         # navigation event may retry when lateral control becomes available.
         self._active_nav_signal_test_id = None
         self._last_nav_signal_request = None
-        self._nav_signal_retry_after_ns = 0
     now = time.monotonic()
     service = "navLaneIntentSP"
     fresh = bool(
       self.sm.seen[service] and self.sm.alive[service] and self.sm.valid[service] and
-      now - self.sm.recv_time[service] <= CONTEXT_STALE_S
+      0 <= now - self.sm.recv_time[service] <= CONTEXT_STALE_S
     )
     intent = self.sm[service]
     direction = str(intent.direction) if fresh else "none"
@@ -230,6 +273,11 @@ class TeslaCardAdapter:
       return
     if now_nanos < self._nav_signal_retry_after_ns:
       return
+    # The existing ownership and retry interval bound submissions. Do not
+    # exhaust a navigation session with a separate lifetime request quota.
+    event_id = int(getattr(intent, "maneuverEventId", 0))
+    if not session_id or event_id <= 0:
+      return
     session_tag = hashlib.sha256(session_id.encode()).hexdigest()[:8]
     test_id = f"nav-{session_tag}-{key[1]}-{key[2]}-{direction}"
     accepted = self.validation.submit_request(
@@ -239,7 +287,7 @@ class TeslaCardAdapter:
     if accepted:
       self._last_nav_signal_request = key
       self._active_nav_signal_test_id = test_id
-      self._nav_signal_retry_after_ns = 0
+      self._nav_signal_retry_after_ns = now_nanos + NAV_SIGNAL_RETRY_NS
     elif not self.validation.configured:
       # Capability is fixed when card/Panda initialize; retrying cannot make it
       # available until the next onroad cycle.
@@ -278,13 +326,18 @@ class TeslaCardAdapter:
       self.traffic_control_observer.snapshot(time.monotonic_ns() if now_ns is None else now_ns),
     )
 
-  def update_context(self, now: float | None = None) -> None:
+  def update_context(self, now: float | None = None, *, radar_now_ns: int | None = None, radar_data=None) -> None:
+    timestamp = time.monotonic() if now is None else now
+    if self.radar_pose_calibrator is not None:
+      motion_now_ns = int(timestamp * 1e9) if radar_now_ns is None else radar_now_ns
+      self.radar_transmitter.update_yaw_rate(*radar_yaw_rate_context(self.sm, motion_now_ns, self.radar_pose_calibrator, self.radar_yaw_cache))
+      if radar_data is not None and not self.radar_transmitter.yaw_rate_valid(motion_now_ns):
+        radar_data.errors.radarUnavailableTemporary = True
     state = getattr(self.car_interface, "CS", None)
     update_longitudinal = getattr(state, "update_longitudinal_context", None)
     if not self.enabled or update_longitudinal is None:
       return
 
-    timestamp = time.monotonic() if now is None else now
     update_longitudinal(*longitudinal_context(self.sm, timestamp))
 
     update_speed_limit = getattr(state, "update_speed_limit_target", None)

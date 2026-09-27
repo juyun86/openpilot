@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 from openpilot.cereal import custom
 from opendbc.sunnypilot.car.tesla.values import TeslaFlagsSP
@@ -20,6 +21,7 @@ MAX_MANEUVER_DISTANCE_M = 2_000.0
 MAX_NAV_SPEED_MPS = V_CRUISE_MAX / 3.6
 MIN_TARGET_SPEED_MPS = 2.0
 RELEASE_ACCEL_MPS2 = 1.0
+SOURCE_RECOVERY_NS = 4_000_000_000
 
 TARGET_SPEEDS = {
   NavManeuver.slightLeft: 8.0,
@@ -30,10 +32,6 @@ TARGET_SPEEDS = {
   NavManeuver.sharpRight: 3.5,
   NavManeuver.uTurnLeft: 2.5,
   NavManeuver.uTurnRight: 2.5,
-  NavManeuver.exitLeft: 10.0,
-  NavManeuver.exitRight: 10.0,
-  NavManeuver.rampLeft: 10.0,
-  NavManeuver.rampRight: 10.0,
   NavManeuver.roundabout: 6.0,
 }
 
@@ -54,6 +52,7 @@ class NavigationSpeedController:
     self.target_speed = 0.0
     self.required_distance = 0.0
     self.event_activated = False
+    self.source_interrupted_ns = 0
     self._settings_provider = settings_provider if settings_provider is not None else SettingsCache().read
 
   @staticmethod
@@ -77,6 +76,7 @@ class NavigationSpeedController:
     if self.event_activated:
       self.event_rejected = True
     self.event_admitted = False
+    self.source_interrupted_ns = 0
 
   @staticmethod
   def _required_distance(v_ego: float, target_speed: float) -> float:
@@ -85,6 +85,16 @@ class NavigationSpeedController:
 
   @staticmethod
   def _target_for(nav, settings: NavAssistSettings | None = None) -> float | None:
+    # A ramp/exit name does not specify its curvature or a safe target speed.
+    # Reuse existing curve/longitudinal planners unless an explicit advisory exists,
+    # as for highway slight guidance. Approach roads need not be road class 0/6.
+    if (nav.maneuver.raw in (NavManeuver.exitLeft, NavManeuver.exitRight, NavManeuver.rampLeft, NavManeuver.rampRight)
+        or (getattr(nav, 'roadClass', -1) in (0, 6)
+            and nav.maneuver.raw in (NavManeuver.slightLeft, NavManeuver.slightRight))):
+      if not nav.advisorySpeedValid:
+        return None
+      advisory = float(nav.advisorySpeedMps)
+      return max(MIN_TARGET_SPEED_MPS, min(MAX_NAV_SPEED_MPS, advisory)) if math.isfinite(advisory) and advisory > 0 else None
     # Cap'n Proto enum readers compare with integers but hash differently.
     # Use the numeric wire value when looking up the integer-keyed speed table.
     default = TARGET_SPEEDS.get(nav.maneuver.raw)
@@ -133,7 +143,13 @@ class NavigationSpeedController:
       return
 
     if not self._healthy(sm):
-      self._pause_event()
+      if self.event_activated and not self.event_rejected:
+        if not self.source_interrupted_ns:
+          self.source_interrupted_ns = time.monotonic_ns()
+        elif time.monotonic_ns() - self.source_interrupted_ns > SOURCE_RECOVERY_NS:
+          self._pause_event()
+      else:
+        self._pause_event()
       self._release(v_cruise, a_ego)
       return
 
@@ -147,6 +163,14 @@ class NavigationSpeedController:
       return
 
     required_distance = self._required_distance(v_ego, target_speed)
+    if self.source_interrupted_ns:
+      recovering_same_event = event_key == self.event_key
+      expired = time.monotonic_ns() - self.source_interrupted_ns > SOURCE_RECOVERY_NS
+      self.source_interrupted_ns = 0
+      if recovering_same_event and (expired or (v_ego > target_speed and distance < required_distance + ADMISSION_MARGIN_M)):
+        self._pause_event()
+        self._release(v_cruise, a_ego)
+        return
     if event_key != self.event_key or (not self.event_admitted and not self.event_rejected):
       self.event_key = event_key
       self.target_speed = target_speed

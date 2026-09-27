@@ -1,5 +1,22 @@
 # sp-dev-egpu to sunnypilot dev migration plan
 
+## 2026-09-19 applicability review
+
+This document retains the historical migration baselines, scope, and test-build
+policy. It is not a fresh inventory of the running device or an instruction to
+repeat completed migration work. The current City NOA scope is defined by the
+[master plan](../../C3_CITY_NOA_MASTER_PLAN.md) and the
+[consolidated lane-change plan](../../C3_LANE_CHANGE_CONSOLIDATED_PLAN.md).
+
+Minimum intrusion is the highest engineering constraint: reuse existing
+implementations and change only the locations needed for a confirmed issue.
+This NOA/design review does not reopen hardware/boot migration, replace planner
+backends, duplicate radar processing, add services, or enable the historical
+Shadow mode listed below. Do not port whole files or move working features merely
+to match the old slice boundaries. Recheck the relevant current code before
+treating a historical pending item as unfinished work; retain unrelated changes.
+This review edits documentation only and authorizes no device writes.
+
 ## Verified baselines
 
 | Role | Commit | Use |

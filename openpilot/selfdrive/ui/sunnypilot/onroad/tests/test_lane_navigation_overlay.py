@@ -183,7 +183,7 @@ def test_navigation_overlay_makes_fork_now_bypass_visible():
   )
   lane_intent = SimpleNamespace(
     signalRequested=True, direction="right", targetLaneIndex=1,
-    forkNow=True, spLaneChangeReady=False,
+    forkNow=True, spLaneChangeReady=False, ignoreSolidBoundary=True,
   )
 
   display = navigation_display_from_service(
@@ -193,6 +193,13 @@ def test_navigation_overlay_makes_fork_now_bypass_visible():
 
   assert display is not None
   assert display.detail == "右分叉请求 · 实线放行"
+  lane_intent.ignoreSolidBoundary = False
+  display = navigation_display_from_service(
+    nav, seen=True, alive=True, valid=True,
+    lane_intent=lane_intent, lane_intent_healthy=True,
+  )
+  assert display.detail == "右分叉请求"
+
 
 
 def test_tici_overlay_layout_is_bounded_and_embeds_lane_footer_in_navigation_card():

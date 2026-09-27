@@ -145,6 +145,23 @@ def link_up() -> bool:
     os.close(fd)
 
 
+def link_down() -> bool:
+  try:
+    path, _, _ = find_runtime_chestnut()
+    if path is None:
+      return False
+    fd = open_device(path)
+  except (OSError, RuntimeError):
+    return False
+  try:
+    fcntl.ioctl(fd, USBDEVFS_CONTROL, Ctrl(0x40, 0xF3, 0, 0, 0, 2000, None))
+    return True
+  except OSError:
+    return False
+  finally:
+    os.close(fd)
+
+
 def claim_interface(path, setup=False):
   # unbind usb-storage, which binds to the ROM bootloader
   disable_runtime_pm(path)

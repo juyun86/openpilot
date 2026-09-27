@@ -56,7 +56,7 @@ class ChevronMetrics:
     if not text_lines:
       return
 
-    self._render_text_lines(text_lines, chevron_x, chevron_y, sz, rect)
+    self._render_text_lines(text_lines, chevron_x, chevron_y, sz, rect, bool(lead_data.radar))
 
   @staticmethod
   def _build_text_lines(d_rel: float, v_rel: float, v_ego: float) -> list[str]:
@@ -87,7 +87,7 @@ class ChevronMetrics:
     return text_lines
 
   def _render_text_lines(self, text_lines: list[str], chevron_x: float, chevron_y: float,
-                         sz: float, rect: rl.Rectangle):
+                         sz: float, rect: rl.Rectangle, radar_fused: bool):
     """Render text lines with proper centering and positioning"""
     font_size = 40
     line_height = 50
@@ -103,7 +103,8 @@ class ChevronMetrics:
       text_y = max(margin, text_y)
 
     alpha = int(255 * self._lead_status_alpha)
-    text_color = rl.Color(255, 255, 255, alpha)
+    # Gold identifies a radar-backed lead; white identifies a vision-only lead.
+    text_color = rl.Color(255, 215, 0, alpha) if radar_fused else rl.Color(255, 255, 255, alpha)
     shadow_color = rl.Color(0, 0, 0, int(200 * self._lead_status_alpha))
 
     for i, line in enumerate(text_lines):

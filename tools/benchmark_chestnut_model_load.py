@@ -128,7 +128,7 @@ def main(argv=None) -> int:
       for key, value in state.numpy_inputs.items()
       if key not in ("tfm", "big_tfm", "prev_feat")
     }
-    outputs = state.run(dummy_frames, transforms, dummy_inputs, False)
+    outputs = state.run(dummy_frames, transforms, dummy_inputs)
     report["ready_seconds"] = time.monotonic() - started
     arrays = {key: value for key, value in outputs.items() if isinstance(value, np.ndarray)}
     report["output_arrays"] = len(arrays)

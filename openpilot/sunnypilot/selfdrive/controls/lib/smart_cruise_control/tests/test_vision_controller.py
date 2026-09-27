@@ -19,7 +19,7 @@ from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control import MIN_V
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.vision_controller import (
-  SmartCruiseControlVision, _ENTERING_CONFIRMATION_FRAMES, _ENTERING_PRED_LAT_ACC_TH,
+  SmartCruiseControlVision, _ENTERING_CONFIRMATION_FRAMES, _ENTERING_PRED_LAT_ACC_TH, _EXIT_CONFIRMATION_FRAMES,
 )
 from openpilot.common.test import OpenpilotTestCase
 
@@ -235,4 +235,76 @@ class TestSmartCruiseControlVision(OpenpilotTestCase):
       assert self.scc_v.max_pred_lat_acc < th
       assert self.scc_v.state == VisionState.enabled
 
-  # TODO-SP: mock modelV2 data to test other states
+  def set_turn_demand(self, predicted: float, current: float) -> None:
+    n = len(ModelConstants.T_IDXS)
+    self.sm['modelV2'].velocity.x = [10.0] * n
+    self.sm['modelV2'].orientationRate.z = [predicted / 10.0] * n
+    self.sm['controlsState'].desiredCurvature = current / 100.0
+
+  def test_recorded_curve_prediction_dip_does_not_release_mid_bend(self):
+    fixture = json.loads((Path(__file__).parent / 'fixtures/sccv_turn_release.json').read_text())
+    self.scc_v.state = VisionState.entering
+    self.scc_v.long_enabled = True
+    self.scc_v.long_override = False
+    for frame in fixture['frames']:
+      self.scc_v.v_ego = frame['v']
+      self.scc_v.current_lat_acc = frame['current']
+      self.scc_v.max_pred_lat_acc = frame['predicted']
+      self.scc_v._update_state_machine()
+      # At 07:28:40 the prediction briefly clears, then current/predicted
+      # demand returns. Keep control through that dip, but release on exit.
+      if frame['ms'] < 1790033322000:
+        assert self.scc_v.state == VisionState.entering
+    assert self.scc_v.state == VisionState.enabled
+
+  @parameterized.expand([('entering', VisionState.entering), ('leaving', VisionState.leaving)])
+  def test_turn_release_requires_sustained_clear_demand(self, _, state):
+    self.scc_v.state = state
+    self.set_turn_demand(0.9, 0.9)
+    for _ in range(_EXIT_CONFIRMATION_FRAMES - 1):
+      self.scc_v.update(self.sm, True, False, 10.0, 0.0, 20.0)
+      assert self.scc_v.state == state
+      assert self.scc_v.is_active
+      assert self.scc_v.output_v_target != V_CRUISE_UNSET
+    self.scc_v.update(self.sm, True, False, 10.0, 0.0, 20.0)
+    assert self.scc_v.state == VisionState.enabled
+    assert not self.scc_v.is_active
+    assert self.scc_v.output_v_target == V_CRUISE_UNSET
+
+  @parameterized.expand([
+    ('entering_current_curve', VisionState.entering, 0.9, 1.2),
+    ('entering_prediction_returns', VisionState.entering, 1.2, 0.9),
+    ('leaving_current_curve', VisionState.leaving, 0.9, 1.2),
+    ('leaving_prediction_returns', VisionState.leaving, 1.2, 0.9),
+  ])
+  def test_curve_evidence_resets_release_confirmation(self, _, state, predicted, current):
+    self.scc_v.state = state
+    self.set_turn_demand(0.9, 0.9)
+    for _ in range(_EXIT_CONFIRMATION_FRAMES - 1):
+      self.scc_v.update(self.sm, True, False, 10.0, 0.0, 20.0)
+    self.set_turn_demand(predicted, current)
+    self.scc_v.update(self.sm, True, False, 10.0, 0.0, 20.0)
+    assert self.scc_v.state == state
+    self.set_turn_demand(0.9, 0.9)
+    for _ in range(_EXIT_CONFIRMATION_FRAMES - 1):
+      self.scc_v.update(self.sm, True, False, 10.0, 0.0, 20.0)
+      assert self.scc_v.state == state
+    self.scc_v.update(self.sm, True, False, 10.0, 0.0, 20.0)
+    assert self.scc_v.state == VisionState.enabled
+
+  @parameterized.expand([
+    ('gas', True, True, True, VisionState.overriding),
+    ('longitudinal_off', False, False, True, VisionState.disabled),
+    ('feature_off', True, False, False, VisionState.disabled),
+  ])
+  def test_turn_release_confirmation_never_delays_override_or_disable(self, _, long_enabled, override, enabled, expected):
+    self.scc_v.state = VisionState.entering
+    self.set_turn_demand(0.9, 0.9)
+    for _ in range(_EXIT_CONFIRMATION_FRAMES - 1):
+      self.scc_v.update(self.sm, True, False, 10.0, 0.0, 20.0)
+    self.params.put_bool('SmartCruiseControlVision', enabled, block=True)
+    self.scc_v.enabled = enabled
+    self.scc_v.update(self.sm, long_enabled, override, 10.0, 0.0, 20.0)
+    assert self.scc_v.state == expected
+    assert not self.scc_v.is_active
+    assert self.scc_v.output_v_target == V_CRUISE_UNSET

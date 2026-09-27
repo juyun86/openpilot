@@ -28,7 +28,9 @@ from openpilot.common.realtime import config_realtime_process, DT_MDL
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 from openpilot.common.transformations.model import get_warp_matrix
-from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
+from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper, LANE_CHANGE_SPEED_MIN
+from openpilot.sunnypilot.selfdrive.controls.lib.oem_lane_change_gate import OemLaneChangeGate, lane_change_start_permissions
+from openpilot.sunnypilot.selfdrive.controls.lib.turn_entry import TurnEntryGate, TurnCompletionTracker
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, should_stop, smooth_value, get_curvature_from_plan
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
 from openpilot.selfdrive.modeld.compile_modeld import make_input_queues, nv12_copy_size, MODELD_INPUTS
@@ -218,20 +220,23 @@ class ModelState(ModelStateBase):
     self.prev_desire[:] = 0
 
 
-def main(demo=False):
+def _main(demo=False):
   cloudlog.warning("modeld init")
 
   chestnut_available = chestnut_present() and chestnut_compiled()
   CHESTNUT = False
   if chestnut_available:
-    poller = messaging.Poller()
-    sock = messaging.sub_sock("chestnutState", poller=poller, conflate=True)
-    deadline = time.monotonic() + 4. / SERVICE_LIST['deviceState'].frequency
-    while not CHESTNUT and (remaining := deadline - time.monotonic()) > 0.:
-      if not poller.poll(round(remaining * 1000)):
-        break
-      msg = messaging.recv_one_or_none(sock)
-      CHESTNUT = msg is not None and msg.valid and chestnut_ready(msg.chestnutState)
+    from openpilot.system.hardware.chestnut.flash import link_up
+    CHESTNUT = link_up()
+    if not CHESTNUT:
+      poller = messaging.Poller()
+      sock = messaging.sub_sock("chestnutState", poller=poller, conflate=True)
+      deadline = time.monotonic() + 4. / SERVICE_LIST['deviceState'].frequency
+      while not CHESTNUT and (remaining := deadline - time.monotonic()) > 0.:
+        if not poller.poll(round(remaining * 1000)):
+          break
+        msg = messaging.recv_one_or_none(sock)
+        CHESTNUT = msg is not None and msg.valid and chestnut_ready(msg.chestnutState)
   if CHESTNUT:
     os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
   params = Params()
@@ -301,8 +306,8 @@ def main(demo=False):
   pm = PubMaster(pub_socks)
   sm = SubMaster([
     "deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState",
-    "carControl", "lateralDelay", "navLaneIntentSP", "laneTopologyStateSP",
-  ])
+    "carControl", "lateralDelay", "navLaneIntentSP", "laneTopologyStateSP", "navAssistStateSP",
+  ], frequency=ModelConstants.MODEL_RUN_FREQ)
 
   publish_state = PublishState()
   params = Params()
@@ -333,6 +338,10 @@ def main(demo=False):
   prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
+  turn_entry = TurnEntryGate()
+  turn_completion = TurnCompletionTracker(CP.steerActuatorDelay)
+  oem_gate = OemLaneChangeGate() if CP.brand == 'tesla' else None
+  oem_can_sock = messaging.sub_sock('can', conflate=False) if oem_gate is not None else None
   RELC = RoadEdgeLaneChangeController()
   LINE_BLOCKER = LaneChangeBoundaryBlocker()
 
@@ -462,31 +471,83 @@ def main(demo=False):
       )
       left_unknown, left_ignore_solid = nav_lane_crossing_policy(nav_lane_intent, "left")
       right_unknown, right_ignore_solid = nav_lane_crossing_policy(nav_lane_intent, "right")
+      topology = sm['laneTopologyStateSP']
+      left_start_allowed, right_start_allowed = (True, True)
+      lane_change_entry = v_ego >= LANE_CHANGE_SPEED_MIN or bool(
+        nav_lane_intent is not None and nav_lane_intent.valid and nav_lane_intent.signalRequested
+        and nav_lane_intent.targetLaneIndex >= 0 and nav_lane_intent.forkNow
+      )
+      oem_solid_override = (False, False)
+      if oem_gate is not None:
+        oem_can_events = messaging.drain_sock(oem_can_sock, wait_for_one=False)
+        gate_now_ns = time.monotonic_ns()
+        oem_permissions = oem_gate.update(oem_can_events, gate_now_ns)
+        left_start_allowed, right_start_allowed = lane_change_start_permissions(
+          topology, healthy=lane_topology_healthy, now_ns=gate_now_ns,
+          oem_permissions=oem_permissions, safety_blocks=oem_gate.lane_change_safety_blocks,
+        )
+        oem_solid_override = tuple(oem_permissions[i] and not oem_gate.safety_blocks[i]
+                                   and lane_change_entry for i in range(2))
       left_line_blocked, right_line_blocked = LINE_BLOCKER.update(
-        sm['laneTopologyStateSP'], healthy=lane_topology_healthy,
+        topology, healthy=lane_topology_healthy,
         ignore_left_solid=left_ignore_solid,
         ignore_right_solid=right_ignore_solid,
+        allow_left_oem_solid=oem_solid_override[0],
+        allow_right_oem_solid=oem_solid_override[1],
       )
-      topology = sm['laneTopologyStateSP']
       left_crossing_allowed = lane_topology_nav_crossing_allowed(
         topology, side="left", healthy=lane_topology_healthy,
-        allow_unknown=left_unknown, ignore_solid=left_ignore_solid,
+        allow_unknown=left_unknown, ignore_solid=left_ignore_solid or oem_solid_override[0],
+        nav_intent=nav_lane_intent,
       )
       right_crossing_allowed = lane_topology_nav_crossing_allowed(
         topology, side="right", healthy=lane_topology_healthy,
-        allow_unknown=right_unknown, ignore_solid=right_ignore_solid,
+        allow_unknown=right_unknown, ignore_solid=right_ignore_solid or oem_solid_override[1],
+        nav_intent=nav_lane_intent,
       )
+      turn_permissions = {}
+      if oem_gate is not None:
+        left_turn, right_turn = turn_entry.update(
+          modelv2_send.modelV2, topology, healthy=lane_topology_healthy,
+          now_ns=gate_now_ns, model_stamp_ns=meta_main.timestamp_eof,
+          neighbors=oem_gate.neighbors, safety_blocks=oem_gate.safety_blocks,
+          carstate=sm['carState'], model_healthy=extrinsics_calibration_seen and sm.all_checks(['carState', 'carControl']),
+          nav_intent=nav_lane_intent,
+          nav_state=sm['navAssistStateSP'] if sm.all_checks(['navAssistStateSP']) else None,
+        )
+        turn_permissions = {
+          'turn_soft_reentry': True,
+          'left_turn_allowed': left_turn, 'right_turn_allowed': right_turn,
+          'left_neighbor_exists': turn_entry.neighbors[0], 'right_neighbor_exists': turn_entry.neighbors[1],
+          'left_turn_keep_allowed': turn_entry.keep_allowed[0], 'right_turn_keep_allowed': turn_entry.keep_allowed[1],
+          'turn_completed': turn_completion.update(
+            modelv2_send.modelV2, sm['carState'],
+            active=sm['carControl'].latActive and DH.turn_maneuver.state == 'active',
+            model_stamp_ns=meta_main.timestamp_eof, now_ns=gate_now_ns,
+          ),
+        }
+      entry_safety_blocks = ((oem_gate.lane_change_safety_blocks if lane_change_entry else oem_gate.safety_blocks)
+                             if oem_gate is not None else (False, False))
       DH.update(
         sm['carState'], sm['carControl'].latActive, lane_change_prob, left_edge, right_edge,
         nav_lane_intent=nav_lane_intent,
         left_line_blocked=left_line_blocked, right_line_blocked=right_line_blocked,
         left_crossing_allowed=left_crossing_allowed,
         right_crossing_allowed=right_crossing_allowed,
+        left_start_allowed=left_start_allowed, right_start_allowed=right_start_allowed,
+        left_safety_blocked=entry_safety_blocks[0], right_safety_blocked=entry_safety_blocks[1],
+        **turn_permissions,
       )
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
       modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction
 
       mdv2sp_send.modelDataV2SP.laneTurnDirection = DH.lane_turn_direction
+      if oem_gate is not None:
+        mdv2sp_send.modelDataV2SP.turnEntryModelMonoTime = meta_main.timestamp_eof
+        mdv2sp_send.modelDataV2SP.turnEntryInputReason = turn_entry.input_reason
+        mdv2sp_send.modelDataV2SP.turnEntryLeftReason, mdv2sp_send.modelDataV2SP.turnEntryRightReason = turn_entry.detail_reasons
+        mdv2sp_send.modelDataV2SP.turnDecisionReason = DH.turn_decision_reason
+      mdv2sp_send.valid = modelv2_send.valid
 
       fill_driving_model_data(drivingdata_send, modelv2_send)
       fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, extrinsics_calibration_seen)
@@ -495,6 +556,16 @@ def main(demo=False):
       pm.send('cameraOdometry', posenet_send)
       pm.send('modelDataV2SP', mdv2sp_send)
     last_vipc_frame_id = meta_main.frame_id
+
+
+def main(demo=False):
+  try:
+    _main(demo)
+  finally:
+    if chestnut_present():
+      from openpilot.system.hardware.chestnut.flash import link_down
+      if not link_down():
+        cloudlog.error("failed to power down chestnut")
 
 if __name__ == "__main__":
   try:

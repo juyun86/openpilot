@@ -556,6 +556,12 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   laneTurnDirection @0 :TurnDirection;
   leftLaneChangeEdgeBlock @1 :Bool;
   rightLaneChangeEdgeBlock @2 :Bool;
+  # Read-only turn-entry diagnostics. Zero timestamp means an older/non-OEM producer.
+  turnEntryModelMonoTime @3 :UInt64;
+  turnEntryInputReason @4 :Text;
+  turnEntryLeftReason @5 :Text;
+  turnEntryRightReason @6 :Text;
+  turnDecisionReason @7 :Text;
 
   enum TurnDirection {
     none @0;
@@ -644,12 +650,37 @@ struct NavAssistStateSP @0xc2243c65e0340384 {
   rejectReason @37 :RejectReason;
   guidanceObservedAtMs @38 :UInt64;
   trackGeofenceValidDEPRECATED @39 :Bool;
+  parallelRoadStatus @40 :RoadLayerStatus;
+  elevatedRoadStatus @41 :RoadLayerStatus;
+  routeNoticeType @42 :RouteNoticeType;
+  routeNoticeDistanceM @43 :Float32;
+  routeNoticeObservedAtMs @44 :UInt64;
+  laneChangeSpeechCompletedId @45 :Text;
 
   struct LaneGuidance {
     index @0 :UInt8;
     allowedActions @1 :UInt16;
     recommendedActions @2 :UInt16;
     recommended @3 :Bool;
+    routeAvoid @4 :Bool;
+  }
+
+  enum RoadLayerStatus {
+    unknown @0;
+    main @1;
+    side @2;
+  }
+
+  enum RouteNoticeType {
+    none @0;
+    restrictedArea @1;
+    forbiddenArea @2;
+    roadClosed @3;
+    congestion @4;
+    dispatch @5;
+    routeChanged @6;
+    gpsWeak @7;
+    unknown @8;
   }
 
   enum Source {
@@ -790,6 +821,7 @@ struct NavLaneIntentSP @0xcd96dafb67a082d0 {
   forkNow @12 :Bool;  # Fresh exit/ramp/merge inside the bounded final-fork window.
   allowUnknownCrossing @13 :Bool;  # SP policy input; never bypasses stale geometry or road edge.
   ignoreSolidBoundary @14 :Bool;  # SP policy input for forkNow only; road edge remains non-crossable.
+  announcementId @15 :Text;  # Exact pending speech receipt; never grants crossing permission.
 
   enum Direction {
     none @0;

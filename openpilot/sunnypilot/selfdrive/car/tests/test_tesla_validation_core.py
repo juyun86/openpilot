@@ -97,9 +97,9 @@ def test_navigation_lamp_follows_real_sp_starting_to_pre_cycle_until_coordinator
 
   for now_ns, state, expected_lamp in (
     (1_200_000_000, ObservedLaneChangeState.starting, True),
-    (1_800_000_000, ObservedLaneChangeState.pre, True),
-    (2_200_000_000, ObservedLaneChangeState.pre, True),
-    (2_300_000_000, ObservedLaneChangeState.pre, False),
+    (1_800_000_000, ObservedLaneChangeState.finishing, True),
+    (2_200_000_000, ObservedLaneChangeState.finishing, True),
+    (2_800_000_000, ObservedLaneChangeState.pre, False),
   ):
     car = LaneVehicleInput(True, 15.0, left_blinker=True, lane_change_state=state,
                            lane_change_direction=LaneIntentDirection.left)
@@ -109,7 +109,7 @@ def test_navigation_lamp_follows_real_sp_starting_to_pre_cycle_until_coordinator
     assert not controller.status()["cancel_requested"]
     assert intent.signal_requested == expected_lamp
   assert intent.reason == "laneChangeObserved"
-  controller.request_cancel("nav", 2_300_000_000)
+  controller.request_cancel("nav", 2_800_000_000)
   assert controller.status()["cancel_requested"]
 
 

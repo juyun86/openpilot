@@ -59,6 +59,11 @@ def payload(*, session_id="session-a", sequence=1, route_revision=1, valid_for_m
       "roadClass": 0,
       "roadType": 6,
       "advisorySpeedMps": 5.0,
+      "parallelRoadStatus": "main",
+      "elevatedRoadStatus": "side",
+      "routeNoticeType": "road_closed",
+      "routeNoticeDistanceM": 350,
+      "routeNoticeObservedAtMs": SOURCE_WALL_MS,
     },
     "lanes": {
       "observedAtMs": SOURCE_WALL_MS,
@@ -67,6 +72,7 @@ def payload(*, session_id="session-a", sequence=1, route_revision=1, valid_for_m
         "allowedActions": ["STRAIGHT", "RIGHT"],
         "recommendedActions": ["RIGHT"],
         "recommended": True,
+        "routeAvoid": False,
       }],
     },
   }
@@ -84,6 +90,11 @@ def test_parses_bounded_normalized_snapshot():
   assert snapshot.guidance_observed_at_ms == 1_700_000_000_000
   assert snapshot.lanes[0].allowed_actions == LANE_ACTION_BITS["STRAIGHT"] | LANE_ACTION_BITS["RIGHT"]
   assert snapshot.lanes[0].recommended_actions == LANE_ACTION_BITS["RIGHT"]
+  assert not snapshot.lanes[0].route_avoid
+  assert snapshot.parallel_road_status == "main"
+  assert snapshot.elevated_road_status == "side"
+  assert snapshot.route_notice_type == "road_closed"
+  assert snapshot.route_notice_distance_m == 350
 
 
 def test_sequence_route_revision_and_local_ttl():
