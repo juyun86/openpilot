@@ -111,59 +111,6 @@ def test_navigation_target_never_overrides_solid_line_or_road_edge():
     assert desire.lane_change_state == LaneChangeState.preLaneChange
 
 
-@pytest.mark.parametrize(("direction", "start_index", "target_index", "blocker"), [
-  ("left", 1, 0, {"left_edge_detected": True}),
-  ("right", 0, 1, {"right_line_blocked": True}),
-])
-def test_stable_navigation_target_completes_slow_model_without_visual_self_cancel(
-    direction, start_index, target_index, blocker):
-  desire = helper()
-  lane_target = intent(direction=direction, target=target_index)
-  lamp_on = {f"{direction}Blinker": True}
-  crossing_allowed = {f"{direction}_crossing_allowed": True}
-
-  desire.update(car_state(), True, 1.0, nav_lane_intent=lane_target,
-                observed_lane_index=start_index, observed_lane_count=2, **crossing_allowed)
-  for _ in range(3):
-    desire.update(car_state(**lamp_on), True, 1.0, nav_lane_intent=lane_target,
-                  observed_lane_index=start_index, observed_lane_count=2, **crossing_allowed)
-  assert desire.lane_change_state == LaneChangeState.laneChangeStarting
-
-  observed_count = 1 if direction == "left" else 2
-  for _ in range(12):
-    desire.update(car_state(**lamp_on), True, 1.0, nav_lane_intent=lane_target,
-                  observed_lane_index=target_index, observed_lane_count=observed_count,
-                  **crossing_allowed, **blocker)
-
-  assert desire.lane_change_state == LaneChangeState.laneChangeFinishing
-  assert desire.lane_change_direction == getattr(LaneChangeDirection, direction)
-
-
-def test_stable_navigation_target_never_overrides_live_safety_block():
-  desire = helper()
-  lane_target = intent(direction="left", target=0)
-  desire.update(car_state(), True, 1.0, nav_lane_intent=lane_target,
-                observed_lane_index=1, observed_lane_count=2, left_crossing_allowed=True)
-  for _ in range(3):
-    desire.update(car_state(leftBlinker=True), True, 1.0, nav_lane_intent=lane_target,
-                  observed_lane_index=1, observed_lane_count=2, left_crossing_allowed=True)
-  assert desire.lane_change_state == LaneChangeState.laneChangeStarting
-
-  for _ in range(12):
-    desire.update(car_state(leftBlinker=True), True, 1.0,
-                  nav_lane_intent=lane_target, observed_lane_index=0, observed_lane_count=1,
-                  left_crossing_allowed=True, left_edge_detected=True)
-  assert desire.lane_change_state == LaneChangeState.laneChangeFinishing
-  assert desire.lane_change_direction == LaneChangeDirection.left
-
-  desire.update(car_state(leftBlinker=True, leftBlindspot=True), True, 1.0,
-                nav_lane_intent=lane_target, observed_lane_index=0, observed_lane_count=1,
-                left_crossing_allowed=True, left_edge_detected=True)
-
-  assert desire.lane_change_state == LaneChangeState.laneChangeFinishing
-  assert desire.lane_change_direction == LaneChangeDirection.none
-
-
 def test_navigation_turn_signal_does_not_enter_lane_change_state_machine():
   desire = helper()
   turn_only = intent(target=-1)

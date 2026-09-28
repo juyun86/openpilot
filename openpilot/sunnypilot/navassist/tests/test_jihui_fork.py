@@ -374,6 +374,42 @@ def test_completed_approach_budget_does_not_consume_the_single_final_fork(side):
 
 
 @pytest.mark.parametrize('side', ['left', 'right'])
+@pytest.mark.parametrize('driver_cancelled', [False, True])
+def test_unfinished_approach_can_retry_only_as_final_fork_without_driver_cancellation(side, driver_cancelled):
+  nav = guidance(side, distance=100.)
+  visual = SimpleNamespace(visibleLaneCount=3)
+  topology = LaneTopologyInput(True, 3, 1, True, True, True, True)
+  direction = LaneIntentDirection.left if side == 'left' else LaneIntentDirection.right
+  car = LaneVehicleInput(True, 20., **{side + '_blinker': True}, lane_change_direction=direction)
+  coordinator = NavLaneIntentCoordinator()
+  approach = build_lane_plan(nav, visual, healthy=True)
+  for now_ns, state in ((0, ObservedLaneChangeState.off),
+                        (500_000_000, ObservedLaneChangeState.off),
+                        (1_000_000_000, ObservedLaneChangeState.pre),
+                        (1_050_000_000, ObservedLaneChangeState.starting)):
+    request = update_lane_from_navigation(
+      coordinator, nav, approach, topology, replace(car, lane_change_state=state), now_ns=now_ns,
+    )
+  assert request.signal_requested and request.lane_change_ready
+
+  stopped = replace(car, lane_change_state=ObservedLaneChangeState.finishing,
+                    lane_change_direction=LaneIntentDirection.none,
+                    steering_pressed=driver_cancelled)
+  terminal = update_lane_from_navigation(coordinator, nav, approach, topology, stopped, now_ns=1_100_000_000)
+  assert terminal.reason == 'laneChangeCancelled' and not terminal.signal_requested
+
+  nav.maneuverDistanceM = 50.
+  fork = build_lane_plan(nav, visual, healthy=True)
+  retry = update_lane_from_navigation(coordinator, nav, fork, topology, car, now_ns=1_150_000_000)
+  assert fork.force_fork
+  assert retry.signal_requested == (not driver_cancelled)
+  assert retry.lane_change_ready == (not driver_cancelled)
+  assert coordinator.fork_active == (not driver_cancelled)
+  if driver_cancelled:
+    assert retry.reason == 'laneChangeCancelled'
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
 def test_absolute_approach_upgrades_to_one_relative_fork_model_cycle(side):
   recommended = 0 if side == 'left' else 2
   nav = guidance(side, distance=100., lanes=[SimpleNamespace(index=i, recommended=i == recommended) for i in range(3)])

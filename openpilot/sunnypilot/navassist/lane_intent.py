@@ -232,6 +232,7 @@ class NavLaneIntentCoordinator:
     self._terminal_event_key = None
     self._terminal_reason = ""
     self._terminal_fork = False
+    self._terminal_driver_cancelled = False
     self._request_id = 0
     self._expected_lane_index = -1
     self._completion_since_ns = 0
@@ -299,6 +300,7 @@ class NavLaneIntentCoordinator:
         self._terminal_event_key = event_key
         self._terminal_reason = "forkCompleted"
         self._terminal_fork = True
+        self._terminal_driver_cancelled = False
         self._reset()
         return self._idle("forkCompleted")
       self._phase = "cooldown"
@@ -364,7 +366,7 @@ class NavLaneIntentCoordinator:
       reason="neighborObservationPaused" if self._observation_lamp_released else "neighborObservationHold",
     )
 
-  def _abort(self, event_key, reason: str) -> NavLaneIntent:
+  def _abort(self, event_key, reason: str, *, driver_cancelled: bool = False) -> NavLaneIntent:
     if self.announcement_id and self._phase in ("signaling", "ready", "observing"):
       reason = "laneChangeAnnouncementFailed"
     if self._phase == "changing" or reason in ("laneChangeCancelled", "laneChangeCompletionUnconfirmed", "laneChangeAnnouncementFailed"):
@@ -372,6 +374,7 @@ class NavLaneIntentCoordinator:
       self._terminal_reason = ("laneChangeCompletionUnconfirmed" if self._phase == "changing"
                                and reason != "laneChangeCancelled" else reason)
       self._terminal_fork = self._candidate_fork
+      self._terminal_driver_cancelled = driver_cancelled
     self._blocked_key = event_key
     self._reset()
     return self._idle(reason)
@@ -398,19 +401,39 @@ class NavLaneIntentCoordinator:
       allow_new_lane_change = True
     if self._terminal_event_key is not None:
       session, _revision, event = self._terminal_event_key
+      final_retry = bool(
+        plan.force_fork and not self._terminal_fork
+        and self._terminal_reason in ("laneChangeCancelled", "laneChangeCompletionUnconfirmed")
+        and not self._terminal_driver_cancelled
+        and self._event_key(plan) == self._terminal_event_key
+      )
       # A source gap (including event=0) is not a new manoeuvre. Revision
       # changes alone must not revive a cancelled or unconfirmed action.
-      if (not (plan.valid or (self._terminal_fork and plan.navigation_valid))
+      if final_retry:
+        self._terminal_event_key = None
+        self._terminal_reason = ""
+        self._terminal_fork = False
+        self._terminal_driver_cancelled = False
+        self._blocked_key = None
+      elif (not (plan.valid or (self._terminal_fork and plan.navigation_valid))
           or not plan.session_id or plan.maneuver_event_id == 0
           or (plan.session_id == session and plan.maneuver_event_id == event)):
         return self._idle(self._terminal_reason)
-      self._terminal_event_key = None
-      self._terminal_reason = ""
-      self._terminal_fork = False
+      else:
+        self._terminal_event_key = None
+        self._terminal_reason = ""
+        self._terminal_fork = False
+        self._terminal_driver_cancelled = False
     if (self._candidate is not None and self._phase in ("signaling", "ready", "observing", "changing")
         and vehicle.lane_change_state == ObservedLaneChangeState.finishing
         and vehicle.lane_change_direction == LaneIntentDirection.none):
-      return self._abort(self._candidate[0], "laneChangeCancelled")
+      # Preserve an explicit driver cancellation, while allowing an approach
+      # stopped by changing boundary/safety evidence to retry once in jihui's
+      # separate final-fork window with every current gate checked again.
+      return self._abort(
+        self._candidate[0], "laneChangeCancelled",
+        driver_cancelled=vehicle.steering_pressed or vehicle.brake_pressed,
+      )
     if self._phase in ("signaling", "ready", "observing") and self._candidate is not None:
       _event_key, start_ego, direction, _target_index, _relative_edge = self._candidate
       if (plan.force_fork and self._event_key(plan) == _event_key
