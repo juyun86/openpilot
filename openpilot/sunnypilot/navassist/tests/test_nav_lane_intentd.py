@@ -51,6 +51,35 @@ def test_final_fork_scope_accepts_confirmed_elevated_route_but_not_ordinary_road
   assert not scope.update(ordinary, linked=True)
 
 
+def test_final_fork_scope_does_not_miss_reference_entry_between_amap_distance_samples():
+  scope = FinalForkScope()
+  guidance = nav(sessionId="route", routeRevision=3, maneuver="mergeLeft", roadClass=6,
+                 elevatedRoadStatus="unknown", valid=True, lanes=[], maneuverDistanceM=131.0)
+  assert scope.update(guidance, linked=True)
+  assert not scope.entry_reached
+
+  guidance.maneuverDistanceM = 90.0
+  assert scope.update(guidance, linked=True)
+  assert scope.entry_reached
+  plan = build_lane_plan(guidance, topology(count=0), healthy=True,
+                         final_fork_allowed=True, final_fork_entry_reached=scope.entry_reached)
+  assert plan.valid and plan.force_fork and plan.edge_direction == LaneIntentDirection.left
+
+  next_event = SimpleNamespace(**{**vars(guidance), "maneuverEventId": 12, "maneuverDistanceM": 90.0})
+  assert scope.update(next_event, linked=True)
+  assert not scope.entry_reached
+
+
+def test_final_fork_scope_does_not_predict_entry_without_a_decreasing_sample():
+  scope = FinalForkScope()
+  guidance = nav(sessionId="route", routeRevision=3, maneuver="rampRight", roadClass=6,
+                 elevatedRoadStatus="unknown", valid=True, lanes=[], maneuverDistanceM=90.0)
+  assert scope.update(guidance, linked=True)
+  assert not scope.entry_reached
+  assert scope.update(guidance, linked=True)
+  assert not scope.entry_reached
+
+
 def test_navigation_ready_waits_for_measured_unsafe_adjacent_radar_target():
   model = SimpleNamespace(laneLines=[SimpleNamespace(x=[0., 100.], y=[y, y])
                                      for y in (-5.25, -1.75, 1.75, 5.25)])

@@ -58,13 +58,34 @@ class FinalForkScope:
 
   def __init__(self) -> None:
     self._qualified_key: tuple[str, int, int] | None = None
+    self._distance_key: tuple[str, int, int] | None = None
+    self._last_distance_m: float | None = None
+    self.entry_reached = False
 
   def update(self, nav, *, linked: bool) -> bool:
     event_key = (str(nav.sessionId), int(nav.routeRevision), int(nav.maneuverEventId))
     maneuver = str(nav.maneuver)
     if linked and event_key[2] != 0 and maneuver in LEFT_EXIT_LANE_MANEUVERS | RIGHT_EXIT_LANE_MANEUVERS:
+      if event_key != self._distance_key:
+        self._distance_key = event_key
+        self._last_distance_m = None
+        self.entry_reached = False
       if controlled_access_observed(nav):
         self._qualified_key = event_key
+      distance_m = float(getattr(nav, "maneuverDistanceM", math.nan))
+      if math.isfinite(distance_m) and 0.0 < distance_m:
+        # AMap reports distance in discrete updates. Preserve jihui's 80 m
+        # entry point, but arm one observed distance step before it when the
+        # next equal step would cross 80 m; otherwise a 131 -> 90 -> event-end
+        # sequence never reaches the final-fork branch.
+        if distance_m < FORK_ENTRY_DISTANCE_M:
+          self.entry_reached = True
+        elif (distance_m > FORK_ENTRY_DISTANCE_M and self._last_distance_m is not None
+              and self._last_distance_m > distance_m
+              and self._last_distance_m - distance_m >= distance_m - FORK_ENTRY_DISTANCE_M):
+          self.entry_reached = True
+        if self._last_distance_m != distance_m:
+          self._last_distance_m = distance_m
       return self._qualified_key == event_key
     return False
 
@@ -108,7 +129,8 @@ def neighbor_observation(topology, *, side: str, healthy: bool) -> bool | None:
 def build_lane_plan(nav, topology, *, healthy: bool, settings: NavAssistSettings | None = None,
                     lane_count_override: int | None = None, amap_ego_index: int | None = None,
                     oem_edge_position: str | None = None,
-                    final_fork_allowed: bool | None = None) -> NavLanePlan:
+                    final_fork_allowed: bool | None = None,
+                    final_fork_entry_reached: bool | None = None) -> NavLanePlan:
   settings = settings if settings is not None else NavAssistSettings()
   nav_valid = bool(healthy and nav.valid and not nav.stale and settings.enabled and settings.lane_change_enabled)
   lanes = tuple(nav.lanes)
@@ -125,6 +147,8 @@ def build_lane_plan(nav, topology, *, healthy: bool, settings: NavAssistSettings
   lookahead_m = 0.0
   highway = getattr(nav, 'roadClass', -1) in HIGHWAY_ROAD_CLASSES
   final_fork_allowed = controlled_access_observed(nav) if final_fork_allowed is None else final_fork_allowed
+  final_fork_entry_reached = (math.isfinite(distance_m) and 0.0 < distance_m < FORK_ENTRY_DISTANCE_M
+                              if final_fork_entry_reached is None else final_fork_entry_reached)
   if highway and maneuver in LEFT_HIGHWAY_LANE_MANEUVERS:
     fallback_side, lookahead_m = "left", settings.exit_lane_lookahead_m
   elif highway and maneuver in RIGHT_HIGHWAY_LANE_MANEUVERS:
@@ -139,7 +163,7 @@ def build_lane_plan(nav, topology, *, healthy: bool, settings: NavAssistSettings
     fallback_side, lookahead_m = "right", settings.exit_lane_lookahead_m
   if (nav_valid and final_fork_allowed and int(nav.maneuverEventId) != 0
       and maneuver in LEFT_EXIT_LANE_MANEUVERS | RIGHT_EXIT_LANE_MANEUVERS
-      and math.isfinite(distance_m) and 0.0 < distance_m < FORK_ENTRY_DISTANCE_M):
+      and final_fork_entry_reached):
     # jihui's 80 m doLaneForkNow is in its controlled-access branch. The main
     # loop retains earlier highway/elevated evidence because AMap may switch
     # current-link class to the ramp itself before entering this window.
@@ -377,10 +401,12 @@ def main() -> None:
     # A brief lane-observation gap is not a navigation outage or a loss of
     # actual lateral control. The coordinator bounds it with its existing grace.
     nav_linked = navigation_linked(nav, base_healthy=base_healthy)
+    final_fork_allowed = final_fork_scope.update(nav, linked=nav_linked)
     plan = build_lane_plan(
       nav, topology, healthy=base_healthy, settings=settings,
       lane_count_override=lane_count if geometry_valid else None,
-      final_fork_allowed=final_fork_scope.update(nav, linked=nav_linked),
+      final_fork_allowed=final_fork_allowed,
+      final_fork_entry_reached=final_fork_scope.entry_reached,
     )
     topology_input = LaneTopologyInput(
       valid_for_control=bool(base_healthy and model_healthy and geometry_valid),
