@@ -382,11 +382,12 @@ class NavLaneIntentCoordinator:
       # Keep the selected fork purpose through distance jitter/zero while the
       # same valid navigation action completes, even if lane mapping now fails.
       # Source loss and all existing driver/control vetoes still apply below.
+      fork_lane_count = max(1, topology.visible_lane_count)
       return replace(plan, valid=plan.valid or plan.navigation_valid, force_fork=True,
                      heuristic=self._candidate[4], edge_direction=self._candidate[2],
-                     lane_count=topology.visible_lane_count,
+                     lane_count=fork_lane_count,
                      recommended_indices=(0 if self._candidate[2] == LaneIntentDirection.left
-                                          else max(0, topology.visible_lane_count - 1),))
+                                          else fork_lane_count - 1,))
     return plan
 
   def update(self, plan: NavLanePlan, topology: LaneTopologyInput, vehicle: LaneVehicleInput,
@@ -436,10 +437,10 @@ class NavLaneIntentCoordinator:
       and (self._phase == "changing" or vehicle.speed_mps >= self.MIN_SPEED_MPS
            or (plan.force_fork and vehicle.speed_mps > 0.0))
     )
-    topology_healthy = bool(
+    topology_healthy = bool(plan.force_fork or (
       topology.valid_for_control and plan.lane_count == topology.visible_lane_count
       and 0 <= topology.ego_lane_index < topology.visible_lane_count
-    )
+    ))
     relative_direction = self._relative_direction(plan)
     if relative_direction != LaneIntentDirection.none and (not base_healthy or not topology_healthy):
       self._relative_consistency.update(

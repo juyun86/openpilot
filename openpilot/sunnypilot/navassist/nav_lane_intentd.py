@@ -137,7 +137,7 @@ def build_lane_plan(nav, topology, *, healthy: bool, settings: NavAssistSettings
     fallback_side, lookahead_m = "left", settings.exit_lane_lookahead_m
   elif maneuver in RIGHT_EXIT_LANE_MANEUVERS:
     fallback_side, lookahead_m = "right", settings.exit_lane_lookahead_m
-  if (nav_valid and final_fork_allowed and int(nav.maneuverEventId) != 0 and lane_count > 0
+  if (nav_valid and final_fork_allowed and int(nav.maneuverEventId) != 0
       and maneuver in LEFT_EXIT_LANE_MANEUVERS | RIGHT_EXIT_LANE_MANEUVERS
       and math.isfinite(distance_m) and 0.0 < distance_m < FORK_ENTRY_DISTANCE_M):
     # jihui's 80 m doLaneForkNow is in its controlled-access branch. The main
@@ -146,9 +146,10 @@ def build_lane_plan(nav, topology, *, healthy: bool, settings: NavAssistSettings
     # Keep ordinary-road approach alignment below; only final fork is scoped.
     # A split need not already be classified as a complete adjacent lane.
     # Retain C3's visual/OEM crossing, road-edge, blindspot and radar gates.
+    fork_lane_count = max(1, lane_count)
     return NavLanePlan(
-      True, str(nav.sessionId), int(nav.routeRevision), int(nav.maneuverEventId), lane_count,
-      (0 if fallback_side == "left" else lane_count - 1,), heuristic=True,
+      True, str(nav.sessionId), int(nav.routeRevision), int(nav.maneuverEventId), fork_lane_count,
+      (0 if fallback_side == "left" else fork_lane_count - 1,), heuristic=True,
       edge_direction=LaneIntentDirection.left if fallback_side == "left" else LaneIntentDirection.right,
       force_fork=True, allow_unknown_crossing=False, ignore_solid_boundary=False,
       navigation_valid=nav_valid,

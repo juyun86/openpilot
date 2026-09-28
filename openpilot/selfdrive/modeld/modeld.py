@@ -536,6 +536,10 @@ def _main(demo=False):
         right_crossing_allowed=right_crossing_allowed,
         left_start_allowed=left_start_allowed, right_start_allowed=right_start_allowed,
         left_safety_blocked=entry_safety_blocks[0], right_safety_blocked=entry_safety_blocks[1],
+        observed_lane_index=(int(topology.egoLaneIndexFromLeft)
+                             if lane_topology_healthy and topology.validForControl else None),
+        observed_lane_count=(int(topology.visibleLaneCount)
+                             if lane_topology_healthy and topology.validForControl else 0),
         **turn_permissions,
       )
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state

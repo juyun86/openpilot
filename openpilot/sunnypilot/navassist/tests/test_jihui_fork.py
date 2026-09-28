@@ -67,6 +67,24 @@ def test_final_fork_reaches_model_and_completes_once_without_an_adjacent_lane_in
 
 
 @pytest.mark.parametrize('side', ['left', 'right'])
+@pytest.mark.parametrize('maneuver_prefix', ['ramp', 'merge'])
+def test_final_fork_waits_for_oem_permission_when_visual_topology_is_unavailable(side, maneuver_prefix):
+  nav = guidance(side, maneuver=maneuver_prefix + side.title())
+  plan = build_lane_plan(nav, SimpleNamespace(visibleLaneCount=0), healthy=True)
+  assert plan.valid and plan.force_fork and plan.recommended_indices == (0,)
+  unavailable = LaneTopologyInput(False, 0, -1, None, None, False, False)
+  permitted = replace(unavailable, **{side + '_crossing_allowed': True})
+  coordinator = NavLaneIntentCoordinator()
+  direction = LaneIntentDirection.left if side == 'left' else LaneIntentDirection.right
+
+  waiting = coordinator.update(plan, unavailable, LaneVehicleInput(True, 5.), now_ns=0)
+  assert waiting.signal_requested and not waiting.lane_change_ready and waiting.direction == direction
+  physical = LaneVehicleInput(True, 5., **{side + '_blinker': True})
+  ready = coordinator.update(plan, permitted, physical, now_ns=50_000_000)
+  assert ready.signal_requested and ready.lane_change_ready and ready.direction == direction
+
+
+@pytest.mark.parametrize('side', ['left', 'right'])
 @pytest.mark.parametrize('block', ['permission', 'blindspot', 'edge', 'solid', 'driver', 'standstill'])
 def test_fork_does_not_bypass_control_and_crossing_gates(side, block):
   plan = build_lane_plan(guidance(side), SimpleNamespace(visibleLaneCount=1), healthy=True)
