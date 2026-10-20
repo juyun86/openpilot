@@ -48,7 +48,7 @@ def create():
  data=b''.join(b'\0'+row.astype(np.uint8).tobytes() for row in image)
  def chunk(kind,payload):return struct.pack('!I',len(payload))+kind+payload+struct.pack('!I',zlib.crc32(kind+payload)&0xffffffff)
  png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('!IIBBBBB',image.shape[1],image.shape[0],8,0,0,0,0))+chunk(b'IDAT',zlib.compress(data))+chunk(b'IEND',b'')
- (ROOT/'pair.png').write_bytes(png)
+ (ROOT/'pair.png').write_bytes(png);(ROOT/'pair.png').chmod(0o600)
  state={'bind':'192.168.43.1','token':token,'expires':expires}
  state_path.write_text(json.dumps(state));state_path.chmod(0o600)
  with (ROOT/'pair.log').open('ab') as log:

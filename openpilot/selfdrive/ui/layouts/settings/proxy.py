@@ -4,6 +4,7 @@ import subprocess
 import threading
 import time
 import pyray as rl
+from openpilot.system.ui.lib import application as ui_application
 from openpilot.common.params import Params
 from openpilot.system.ui.lib.application import gui_app, FontWeight, font_fallback
 from openpilot.system.ui.widgets import Widget, DialogResult
@@ -16,6 +17,9 @@ PAIR = '/data/openpilot/openpilot/selfdrive/ui/mihomo_pair.py'
 class ProxyLayout(Widget):
   def __init__(self):
     super().__init__()
+    ui_application.EXTRA_FONT_CHARS += '败板保备本别并不操测插查超车成持出传此存打大代带当导到的点订动读对二发返方分辅该公功过合和核后候换回或击机集加驾兼剪检件建键将接节仅局开可空理立连链量流络码没面模幕内能盘配屏启前切请取全确热认仍容入软扫尚稍设生失十时识使驶式试是手输所态添贴停同退完网维为未文下先效校新行选验页一已用有于与阅运在载择粘正支知直止置中钟重助转状走组作'
+    self._previous_fallback_fonts = list(gui_app._fallback_fonts.values())
+    gui_app._fallback_fonts.clear()
     self._params = Params(); self._queue = queue.Queue(); self._busy = False
     self._status = {}; self._message = '手机连接 C3 热点，点击手机扫码添加订阅'
     self._last = 0.; self._qr = None; self._expires = 0.
