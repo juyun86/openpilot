@@ -1,5 +1,5 @@
 [lfs]
-	url = https://github.com/juyun86/openpilot.git/info/lfs
-	pushurl = https://github.com/juyun86/openpilot.git/info/lfs
+	url = https://github.com/onemiless/openpilot.git/info/lfs
+	pushurl = https://github.com/onemiless/openpilot.git/info/lfs
 
 	locksverify = false
