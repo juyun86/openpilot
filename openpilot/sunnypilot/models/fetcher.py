@@ -121,7 +121,7 @@ class ModelCache:
     """Checks if the cache has expired"""
     current_time = int(time.monotonic() * 1e9)
     last_sync = self.params.get(self._LAST_SYNC_KEY) or 0
-    return bool(last_sync == 0) or (current_time - last_sync) >= self.cache_timeout
+    return last_sync <= 0 or current_time < last_sync or (current_time - last_sync) >= self.cache_timeout
 
   def get(self) -> tuple[dict, bool]:
     """
@@ -147,7 +147,8 @@ class ModelCache:
 
 class ModelFetcher:
   """Handles fetching and caching of model data from remote source"""
-  CATALOG_REF = "da2d8dac5f77e3a6f72fefbfb14edea3555f05f6"
+  # Follow updates to the compatible v25/v28 manifests; the parser still enforces selector version 21.
+  CATALOG_REF = "gh-pages"
   MODEL_URL = f"https://raw.githubusercontent.com/sunnypilot/sunnypilot-models/{CATALOG_REF}/docs/driving_models_v25.json"
   MODEL_URL_CHESTNUT = f"https://raw.githubusercontent.com/sunnypilot/sunnypilot-models/{CATALOG_REF}/docs/driving_models_chestnut_v28.json"
 
