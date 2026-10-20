@@ -1,4 +1,4 @@
-"""Root helper: route only the C3 hotspot through an existing user-owned TUN."""
+"""Root helper for the dedicated C3 proxy core and global/hotspot TUN routing."""
 import ipaddress,json,os,pathlib,socket,subprocess,sys,shutil,signal,time,pwd
 ROOT=pathlib.Path('/data/mihomo');DEV='c3mh0';TABLE='17890';PRIORITY='17890';CHAIN='C3MH_DNS';IPT='iptables-legacy';CORE_UID=61400
 def run(*args,check=True):
@@ -17,10 +17,19 @@ def prepare():
   run('ip','tuntap','add','dev',DEV,'mode','tun','user',str(CORE_UID))
  run('ip','addr','replace','198.18.0.1/30','dev',DEV);run('ip','link','set',DEV,'up')
  pathlib.Path('/proc/sys/net/ipv4/ip_forward').write_text('1')
+def core_pids():
+ result=[]
+ for entry in pathlib.Path('/proc').iterdir():
+  if not entry.name.isdigit():continue
+  try:
+   if entry.stat().st_uid==CORE_UID and (entry/'cmdline').read_bytes().split(b'\0')[0]==str(ROOT/'mihomo').encode():result.append(int(entry.name))
+  except (OSError,ValueError):pass
+ return result
 def startcore():
  try:
   pwd.getpwuid(CORE_UID);raise RuntimeError('Dedicated runtime UID is already assigned')
  except KeyError:pass
+ assert not core_pids(),'代理内核仍在运行，请先停止后重试'
  runtime=ROOT/'runtime';runtime.mkdir(exist_ok=True);runtime.chmod(0o700);os.chown(runtime,CORE_UID,CORE_UID)
  ROOT.chmod(0o711)
  target=runtime/'config.yaml';shutil.copyfile(ROOT/'config.yaml',target);target.chmod(0o600);os.chown(target,CORE_UID,CORE_UID)
@@ -29,16 +38,28 @@ def startcore():
  with (ROOT/'core.log').open('ab') as log:
   process=subprocess.Popen([str(ROOT/'mihomo'),'-d',str(runtime),'-f',str(target)],stdout=log,stderr=log,env=env,start_new_session=True,preexec_fn=demote)
  path=ROOT/'pid';path.write_text(str(process.pid));path.chmod(0o600);os.chown(path,1000,1000)
+ # Popen returns before exec: do not report a launched PID until it is the core.
+ deadline=time.monotonic()+5
+ while time.monotonic()<deadline:
+  if process.poll() is not None:raise RuntimeError('代理内核退出，请检查内核日志')
+  if process.pid in core_pids():return
+  time.sleep(.05)
+ raise RuntimeError('代理内核启动超时')
 def stopcore():
- try:
-  pid=int((ROOT/'pid').read_text())
-  if str(ROOT/'mihomo').encode() not in pathlib.Path(f'/proc/{pid}/cmdline').read_bytes():return
-  os.kill(pid,signal.SIGTERM)
-  for _ in range(30):
-   if not pathlib.Path(f'/proc/{pid}/cmdline').read_bytes():break
-   time.sleep(.1)
- except (OSError,ValueError):pass
- finally:(ROOT/'pid').unlink(missing_ok=True)
+ # A failed early launch can leave a core whose PID is absent or stale.
+ targets=core_pids()
+ for pid in targets:
+  try:os.kill(pid,signal.SIGTERM)
+  except ProcessLookupError:pass
+ deadline=time.monotonic()+4
+ while time.monotonic()<deadline and set(targets)&set(core_pids()):time.sleep(.1)
+ for pid in set(targets)&set(core_pids()):
+  try:os.kill(pid,signal.SIGKILL)
+  except ProcessLookupError:pass
+ deadline=time.monotonic()+1
+ while time.monotonic()<deadline and set(targets)&set(core_pids()):time.sleep(.05)
+ assert not set(targets)&set(core_pids()),'代理内核未能停止'
+ (ROOT/'pid').unlink(missing_ok=True)
 def enable():
  try: _,network=hotspot()
  except (RuntimeError,AssertionError):network=None
@@ -64,7 +85,8 @@ def enable():
  for protocol in ('udp','tcp'):run(IPT,'-t','filter','-A','C3MH_INPUT','-p',protocol,'--dport','17893','-j','REJECT')
  for table,chain,parent in [('mangle','C3MH_MARK','OUTPUT'),('nat','C3MH_OUTDNS','OUTPUT'),('filter','C3MH_INPUT','INPUT')]:
   if run(IPT,'-t',table,'-C',parent,'-j',chain,check=False).returncode:run(IPT,'-t',table,'-I',parent,'-j',chain)
- run('ip','rule','add','priority','17880','fwmark','17890/0xffff','lookup',TABLE)
+ rules=json.loads(run('ip','-j','rule').stdout)
+ if not any(r.get('priority')==17880 and str(r.get('table'))==TABLE for r in rules):run('ip','rule','add','priority','17880','fwmark','17890/0xffff','lookup',TABLE)
  (ROOT/'gateway_enabled').write_text('1')
 def disable():
  (ROOT/'gateway_enabled').unlink(missing_ok=True)
@@ -85,4 +107,8 @@ if __name__=='__main__':
  assert not pathlib.Path('/data/params/d/IsEngaged').exists() or pathlib.Path('/data/params/d/IsEngaged').read_text().strip()!='1'
  try:
   {'prepare':prepare,'enable':enable,'disable':disable,'startcore':startcore,'stopcore':stopcore}[sys.argv[1]]();print(json.dumps({'ok':True}))
- except Exception:print(json.dumps({'error':'热点转发设置失败，请确认热点已开启'}));sys.exit(1)
+ except Exception as error:
+  detail=(error.stderr or '').strip() if isinstance(error,subprocess.CalledProcessError) else str(error)
+  # Only local interface/process commands run here; no subscription data is logged.
+  labels={'prepare':'创建 TUN','startcore':'启动内核','stopcore':'停止内核','enable':'启用路由','disable':'清理路由'}
+  print(json.dumps({'error':labels.get(sys.argv[1],'全局代理')+'失败：'+(detail[:240] or type(error).__name__)},ensure_ascii=False));sys.exit(1)

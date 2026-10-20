@@ -1,4 +1,4 @@
-"""Explicit-proxy management for the C3 touchscreen. No global routes or DNS changes."""
+"""Manage the C3 touchscreen proxy and its dedicated global TUN gateway."""
 import base64
 import fcntl
 import json
@@ -19,8 +19,15 @@ CONFIG = ROOT / 'config.yaml'
 GATEWAY = '/data/openpilot/openpilot/selfdrive/ui/mihomo_gateway.py'
 
 def gateway(action):
-  result = subprocess.run(['sudo', '-n', '/usr/bin/python3', GATEWAY, action], capture_output=True, text=True, timeout=15)
-  if result.returncode: raise RuntimeError('热点代理设置失败，请确认 C3 热点已开启')
+  labels = {'prepare': '创建 TUN', 'startcore': '启动代理内核', 'stopcore': '停止代理内核', 'enable': '启用全局路由', 'disable': '清理全局路由'}
+  try:
+    result = subprocess.run(['sudo', '-n', '/usr/bin/python3', GATEWAY, action], capture_output=True, text=True, timeout=15)
+  except subprocess.TimeoutExpired:
+    raise RuntimeError(labels[action] + '超时，请重试') from None
+  if result.returncode:
+    try: detail = json.loads(result.stdout).get('error')
+    except (ValueError, AttributeError): detail = None
+    raise RuntimeError(detail or labels[action] + '失败，请检查本机权限与内核日志')
 
 def parked():
   assert Path('/data/params/d/IsOffroad').read_text().strip() == '1', '请停车后操作'
@@ -99,40 +106,59 @@ def api(path, payload=None, timeout=4):
 
 def stop():
   (ROOT / 'enabled').unlink(missing_ok=True)
-  if (ROOT / 'gateway_state.json').exists(): gateway('disable')
-  if pid(): gateway('stopcore')
+  # Stop every managed core before deleting its TUN, even if the PID file was lost.
+  try: gateway('stopcore')
+  finally: gateway('disable')
+
+def tun_ready():
+  try:
+    if not (ROOT / 'gateway_enabled').exists() or Path('/sys/class/net/c3mh0/carrier').read_text().strip() != '1': return False
+    routes = subprocess.run(['ip', 'route', 'show', 'table', '17890'], capture_output=True, text=True, timeout=2).stdout
+    rules = json.loads(subprocess.run(['ip', '-j', 'rule'], capture_output=True, text=True, timeout=2).stdout)
+    return 'default dev c3mh0' in routes and any(r.get('priority') == 17880 and str(r.get('table')) == '17890' for r in rules)
+  except (OSError, ValueError, subprocess.TimeoutExpired): return False
 
 def start():
-  if pid(): return
   assert CONFIG.exists(), '请先添加订阅或节点'
   use_tun = yaml.safe_load(CONFIG.read_text()).get('tun', {}).get('enable', False)
-  if use_tun: gateway('prepare')
-  gateway('startcore')
-  for _ in range(30):
-    if not pid():
-      stop(); raise RuntimeError('内核启动失败，请检查配置或网络')
-    try: api('/version')
-    except Exception:
-      time.sleep(.1); continue
+  if pid():
     try:
-      api('/proxies/GLOBAL', {'name': 'C3-PROXY'})
-      if use_tun:
-        for _ in range(20):
-          try:
-            if Path('/sys/class/net/c3mh0/carrier').read_text().strip() == '1': break
-          except OSError: pass
-          time.sleep(.1)
-        else: raise RuntimeError('TUN 未能建立，热点转发未开启')
-        gateway('enable')
-      (ROOT / 'enabled').write_text('1')
-    except Exception:
-      stop(); raise
-    return
-  stop(); raise RuntimeError('内核启动超时')
+      api('/version')
+      if not use_tun or tun_ready():
+        (ROOT / 'enabled').write_text('1')
+        return
+    except Exception: pass
+  # Clear partial launches and stale routes before preparing a new interface.
+  stop()
+  try:
+    if use_tun: gateway('prepare')
+    gateway('startcore')
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+      try:
+        if pid() and api('/version', timeout=1).get('version'): break
+      except Exception: pass
+      time.sleep(.1)
+    else: raise RuntimeError('代理内核未就绪，请检查内核日志后重试')
+    api('/proxies/GLOBAL', {'name': 'C3-PROXY'})
+    if use_tun:
+      deadline = time.monotonic() + 5
+      while time.monotonic() < deadline:
+        try:
+          if Path('/sys/class/net/c3mh0/carrier').read_text().strip() == '1': break
+        except OSError: pass
+        time.sleep(.1)
+      else: raise RuntimeError('TUN 接口未就绪，全局路由未开启')
+      gateway('enable')
+      if not tun_ready(): raise RuntimeError('全局路由未就绪，请重试')
+    (ROOT / 'enabled').write_text('1')
+  except Exception:
+    stop()
+    raise
 
 def status():
   d = yaml.safe_load(CONFIG.read_text()) if CONFIG.exists() else {}
-  result = {'running': bool(pid()), 'configured': bool(d), 'gateway': (ROOT / 'gateway_enabled').exists() and bool(pid()), 'nodes': len(d.get('proxies', [])), 'groups': [], 'message': '尚未添加订阅或节点' if not d else '配置已保存'}
+  result = {'running': bool(pid()), 'configured': bool(d), 'gateway': bool(pid()) and tun_ready(), 'nodes': len(d.get('proxies', [])), 'groups': [], 'message': '尚未添加订阅或节点' if not d else '配置已保存'}
   if result['running']:
     result['version'] = api('/version').get('version')
     result['groups'] = [{'name': name, 'now': p.get('now', ''), 'all': p.get('all', [])} for name, p in api('/proxies').get('proxies', {}).items() if p.get('type') == 'Selector' and name != 'GLOBAL']
@@ -215,8 +241,21 @@ def main(command):
       api('/proxies/' + urllib.parse.quote(g['name'], safe=''), {'name': choices[(index + 1) % len(choices)]})
     elif command == 'test':
       assert pid(), '请先启动代理'
-      result = subprocess.run(['curl', '-fsS', '--proxy', 'http://127.0.0.1:17890', '--noproxy', '', '--connect-timeout', '8', '--max-time', '20', '-o', '/dev/null', '-w', '%{http_code}', 'https://api.github.com/zen'], capture_output=True, text=True)
-      return {'ok': result.returncode == 0, 'message': 'GitHub 连接成功' if result.returncode == 0 else '连接失败，请检查节点和网络', 'http_code': result.stdout}
+      use_tun = yaml.safe_load(CONFIG.read_text()).get('tun', {}).get('enable', False)
+      if use_tun: assert tun_ready(), '全局 TUN 未就绪，请重新启动代理'
+      transport = ['--noproxy', '*', '-4'] if use_tun else ['--proxy', 'http://127.0.0.1:17890', '--noproxy', '']
+      # Public REST API quotas are shared by every user of a node. A quota 403
+      # says nothing about proxy connectivity, so test the normal website.
+      result = subprocess.run(['curl', '-fsS', *transport, '--connect-timeout', '8', '--max-time', '20', '-o', '/dev/null', '-w', '%{http_code}', 'https://github.com/'], capture_output=True, text=True)
+      code = result.stdout.strip()
+      if result.returncode == 0:
+        message = '全局 TUN 访问 GitHub 成功' if use_tun else '代理访问 GitHub 成功'
+      elif code.isdigit() and int(code) >= 400:
+        message = f'已连接网站，但 GitHub 返回 HTTP {code}；请更换节点后重试'
+      else:
+        errors = {6: '域名解析失败', 7: '代理连接失败', 28: '节点连接超时', 35: '节点加密连接失败', 60: '证书校验失败'}
+        message = errors.get(result.returncode, '连接失败') + '，请检查节点和网络'
+      return {'ok': result.returncode == 0, 'message': message, 'http_code': code}
     else: raise ValueError('未知操作')
   return status()
 
