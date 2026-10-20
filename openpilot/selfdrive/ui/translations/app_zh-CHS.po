@@ -1916,6 +1916,12 @@ msgstr "搜索您的车型"
 msgid "Select"
 msgstr "选择"
 
+msgid "Select Country"
+msgstr "选择国家"
+
+msgid "Select State"
+msgstr "选择州"
+
 #: openpilot/selfdrive/ui/sunnypilot/layouts/settings/vehicle/brands/tesla_control.py
 msgid "Select Tesla ACC above the high-speed threshold when the stock longitudinal handoff is ready."
 msgstr "原厂纵向移交就绪且车速高于高速阈值时选择 Tesla ACC。"
