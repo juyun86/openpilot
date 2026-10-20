@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import time
+import re
 
 import requests
 from openpilot.common.mihomo_proxy import download_proxies
@@ -25,6 +26,8 @@ from openpilot.sunnypilot.models.helpers import (ACTIVE_BUNDLE_KEYS, get_active_
 
 # (connect, read) seconds. read is per-request inactivity, not a total cap
 DOWNLOAD_TIMEOUT = (30, 30)
+DOWNLOAD_MAX_RETRIES = 5
+DOWNLOAD_RANGE_SIZE = 16 * 1024 * 1024
 
 
 class DownloadCancelled(Exception):
@@ -85,32 +88,89 @@ class ModelManagerSP:
     return max(1, int(eta))  # Return at least 1 second if download is ongoing
 
   async def _download_file(self, url: str, path: str, model) -> None:
-    """Downloads a file with progress tracking"""
+    """Resume interrupted whole-file artifacts; only verified files are activated."""
     self._download_start_times[model.fileName] = time.monotonic()
-
-    with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT, proxies=download_proxies()) as response:  # noqa: ASYNC210
-      response.raise_for_status()
-      total_size = int(response.headers.get("content-length", 0))
-      bytes_downloaded = 0
-
-      with open(path, 'wb') as f:  # noqa: ASYNC230
-        for chunk in response.iter_content(chunk_size=self._chunk_size):  # type: bytes
-          f.write(chunk)
-          bytes_downloaded += len(chunk)
-
+    initial_size = os.path.getsize(path) if os.path.exists(path) else 0
+    known_total = None
+    retries = 0
+    try:
+      while True:
+        if self._download_interrupted():
+          raise DownloadCancelled("Download cancelled")
+        offset = os.path.getsize(path) if os.path.exists(path) else 0
+        headers = {"Range": f"bytes={offset}-{offset + DOWNLOAD_RANGE_SIZE - 1}", "Accept-Encoding": "identity"}
+        try:
+          with requests.get(url, headers=headers, stream=True, timeout=DOWNLOAD_TIMEOUT, proxies=download_proxies()) as response:  # noqa: ASYNC210
+            if response.status_code == 416:
+              match = re.fullmatch(r"bytes \*/(\d+)", response.headers.get("Content-Range", ""))
+              if match and offset == int(match[1]) and os.path.isfile(path):
+                return  # caller still verifies the complete SHA256
+              if match and offset > int(match[1]):
+                with open(path, 'wb'):  # noqa: ASYNC230
+                  pass
+                initial_size = 0
+                continue
+            response.raise_for_status()
+            if response.headers.get("Content-Encoding", "identity").lower() not in ("", "identity"):
+              raise ValueError("Compressed model ranges cannot be resumed safely")
+            if response.status_code == 206:
+              match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("Content-Range", ""))
+              if not match:
+                raise ValueError("Missing or invalid model Content-Range")
+              begin, end, total_size = map(int, match.groups())
+              if begin != offset or not begin <= end < total_size or end >= offset + DOWNLOAD_RANGE_SIZE:
+                raise ValueError("Server returned a different model byte range")
+              if "Content-Length" in response.headers and int(response.headers["Content-Length"]) != end-begin+1:
+                raise ValueError("Model range length mismatch")
+              mode = 'ab'
+            elif response.status_code == 200:
+              # Range is optional on a server: overwrite instead of appending a full response.
+              offset = initial_size = 0
+              total_size = int(response.headers.get("Content-Length", 0))
+              end = total_size-1 if total_size else None
+              mode = 'wb'
+            else:
+              raise ValueError(f"Unexpected model response status {response.status_code}")
+            if known_total is not None and total_size and known_total != total_size:
+              raise ValueError("Model size changed during download")
+            known_total = total_size or known_total
+            with open(path, mode) as f:  # noqa: ASYNC230
+              for chunk in response.iter_content(chunk_size=self._chunk_size):
+                if not chunk:
+                  continue
+                if end is not None and offset + len(chunk) > end+1:
+                  raise ValueError("Model response exceeded requested byte range")
+                f.write(chunk)
+                offset += len(chunk)
+                if self._download_interrupted():
+                  raise DownloadCancelled("Download cancelled")
+                if total_size:
+                  elapsed = time.monotonic()-self._download_start_times[model.fileName]
+                  received = offset-initial_size
+                  model.downloadProgress.status = custom.ModelManagerSP.DownloadStatus.downloading
+                  model.downloadProgress.progress = offset / total_size * 100
+                  model.downloadProgress.eta = max(1, int((total_size-offset)*elapsed/received)) if received > 0 else 60
+                  self._sync_artifact_progress(model)
+                  self._report_status()
+            if end is not None and offset != end+1:
+              raise requests.exceptions.ChunkedEncodingError("Incomplete model range")
+            retries = 0
+            if not total_size or offset == total_size:
+              return
+        except requests.exceptions.RequestException as error:
+          if isinstance(error, requests.exceptions.HTTPError) and error.response is not None:
+            if error.response.status_code not in (408, 429) and error.response.status_code < 500:
+              raise
           if self._download_interrupted():
-            raise DownloadCancelled("Download cancelled")
-
-          if total_size > 0:
-            progress = (bytes_downloaded / total_size) * 100
-            model.downloadProgress.status = custom.ModelManagerSP.DownloadStatus.downloading
-            model.downloadProgress.progress = progress
-            model.downloadProgress.eta = self._calculate_eta(model.fileName, progress)
-            self._sync_artifact_progress(model)
-            self._report_status()
-
-    # Clean up start time after download completes
-    del self._download_start_times[model.fileName]
+            raise DownloadCancelled("Download cancelled") from error
+          if retries >= DOWNLOAD_MAX_RETRIES:
+            raise
+          retries += 1
+          saved = os.path.getsize(path) if os.path.exists(path) else 0
+          cloudlog.warning(f"Model download retry {retries}: resuming {model.fileName} at {saved} bytes ({type(error).__name__})")
+          await asyncio.sleep(min(8, 2 ** (retries-1)))
+    finally:
+      self._download_start_times.pop(model.fileName, None)
 
   async def _download_chunked(self, base_url: str, base_path: str, artifact, skip: frozenset[int] | set[int] = frozenset()) -> None:
     from openpilot.common.file_chunker import get_chunk_name, get_manifest_path
@@ -169,7 +229,7 @@ class ModelManagerSP:
     if not Path(full_path).resolve().is_relative_to(Path(destination_path).resolve()):  # noqa: ASYNC240
       raise ValueError("Model artifact path escapes destination")
     Path(full_path).parent.mkdir(parents=True, exist_ok=True)
-    temporary = f"{full_path}.{os.getpid()}.download"
+    temporary = f"{full_path}.download"
 
     try:
       # progress counts only valid chunks so a resumed download continues the
@@ -211,6 +271,7 @@ class ModelManagerSP:
       else:
         await self._download_file(url, temporary, artifact)
         if not await verify_file(temporary, expected_hash):
+          os.remove(temporary)  # a complete but corrupt file must not be resumed
           raise ValueError(f"Hash validation failed for {filename}")
         os.replace(temporary, full_path)
 
@@ -221,9 +282,7 @@ class ModelManagerSP:
       self._report_status()
 
     except DownloadCancelled:
-      if os.path.isfile(temporary):  # noqa: ASYNC240
-        os.remove(temporary)
-      # a cancel keeps whatever is on disk: complete chunks resume the next attempt
+      # Keep whole-file prefixes and completed chunks for a later attempt.
       self._download_start_times.pop(artifact.fileName, None)
       artifact.downloadProgress.status = custom.ModelManagerSP.DownloadStatus.failed
       artifact.downloadProgress.eta = 0
@@ -235,8 +294,7 @@ class ModelManagerSP:
 
     except Exception as e:
       cloudlog.error(f"Error downloading {filename}: {str(e)}")
-      if os.path.isfile(temporary):  # noqa: ASYNC240
-        os.remove(temporary)
+      # A transport error must not erase hundreds of MB already downloaded.
       artifact.downloadProgress.status = custom.ModelManagerSP.DownloadStatus.failed
       artifact.downloadProgress.eta = 0
       self._sync_artifact_progress(artifact)
