@@ -28,7 +28,7 @@ class ProxyLayout(Widget):
       chars = fallback_font_characters('zh-CHS', ui_application.EXTRA_FONT_CHARS)
       codepoints = sorted(map(ord, chars))
       data = rl.ffi.new('int[]', codepoints)
-      font = rl.load_font_ex(str(full_font), 48, data, len(codepoints))
+      font = rl.load_font_ex(str(full_font), 48, rl.ffi.cast('int *', data), len(codepoints))
       rl.gen_texture_mipmaps(font.texture)
       rl.set_texture_filter(font.texture, rl.TextureFilter.TEXTURE_FILTER_TRILINEAR)
       gui_app._fallback_fonts['zh-CHS'] = font
