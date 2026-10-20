@@ -12,6 +12,7 @@ import shutil
 import time
 
 import requests
+from openpilot.common.mihomo_proxy import download_proxies
 from openpilot.common.params import Params
 from openpilot.common.realtime import Ratekeeper
 from openpilot.common.swaglog import cloudlog
@@ -87,7 +88,7 @@ class ModelManagerSP:
     """Downloads a file with progress tracking"""
     self._download_start_times[model.fileName] = time.monotonic()
 
-    with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT) as response:  # noqa: ASYNC210
+    with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT, proxies=download_proxies()) as response:  # noqa: ASYNC210
       response.raise_for_status()
       total_size = int(response.headers.get("content-length", 0))
       bytes_downloaded = 0
@@ -131,7 +132,7 @@ class ModelManagerSP:
         chunk_url = get_chunk_name(base_url, i, num_chunks)
         chunk_path = get_chunk_name(base_path, i, num_chunks)
         chunk_downloaded = 0
-        with session.get(chunk_url, stream=True, timeout=DOWNLOAD_TIMEOUT) as response:
+        with session.get(chunk_url, stream=True, timeout=DOWNLOAD_TIMEOUT, proxies=download_proxies()) as response:
           response.raise_for_status()
           chunk_size = int(response.headers.get("content-length", 0))
           with open(chunk_path, 'wb') as f:  # noqa: ASYNC230

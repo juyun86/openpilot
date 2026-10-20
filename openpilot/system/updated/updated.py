@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+from openpilot.common.mihomo_proxy import enabled as mihomo_enabled, PROXY as MIHOMO_PROXY
 import re
 import datetime
 import subprocess
@@ -67,6 +68,8 @@ def write_time_to_param(params, param) -> None:
   params.put(param, t, block=True)
 
 def run(cmd: list[str], cwd: str | None = None) -> str:
+  if cmd and cmd[0] == 'git' and mihomo_enabled():
+    cmd = ['git', '-c', 'http.proxy=' + MIHOMO_PROXY, *cmd[1:]]
   return subprocess.check_output(cmd, cwd=cwd, stderr=subprocess.STDOUT, encoding='utf8')
 
 

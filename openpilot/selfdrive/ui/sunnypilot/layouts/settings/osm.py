@@ -137,7 +137,7 @@ class OSMLayout(Widget):
     key = "OsmLocation" if region_type == "Country" else "OsmState"
     current = ui_state.params.get(f"{key}Name") or ""
 
-    dialog = TreeOptionDialog(tr(f"Select {region_type}"), [TreeFolder(folder="", nodes=locations)], current_ref=current, search_prompt="Perform a search")
+    dialog = TreeOptionDialog((tr("Select Country") if region_type == "Country" else tr("Select State")), [TreeFolder(folder="", nodes=locations)], current_ref=current, search_prompt=tr("Search"))
     dialog.on_exit = lambda res: self._handle_region_selection(region_type, locations, key, res, dialog.selection_ref)
     gui_app.push_widget(dialog)
 

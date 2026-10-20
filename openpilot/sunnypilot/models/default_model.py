@@ -2,6 +2,7 @@ import argparse
 import os
 import hashlib
 import requests
+from openpilot.common.mihomo_proxy import download_proxies
 import re
 
 from openpilot.common.basedir import BASEDIR
@@ -62,7 +63,7 @@ def update_model_hash():
 
 
 def get_ref_for_name(url: str, name: str) -> str:
-  response = requests.get(url, timeout=10)
+  response = requests.get(url, timeout=10, proxies=download_proxies())
   if response.status_code == 200:
     bundles = response.json()["bundles"]
     matching = [b for b in bundles if re.search(name, f"{b['short_name']} {b['display_name']}", re.IGNORECASE)]

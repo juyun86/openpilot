@@ -259,7 +259,7 @@ class SunnylinkLayout(Widget):
 
       if backup_status == custom.BackupManagerSP.Status.inProgress:
         self._backup_in_progress = True
-        text = tr(f"Backing up {backup_progress}%")
+        text = tr("Backing up {}%").format(backup_progress)
         self._backup_btn.set_text(text)
 
       elif backup_status == custom.BackupManagerSP.Status.failed:
@@ -280,7 +280,7 @@ class SunnylinkLayout(Widget):
 
       if restore_status == custom.BackupManagerSP.Status.inProgress:
         self._restore_in_progress = True
-        text = tr(f"Restoring {restore_progress}%")
+        text = tr("Restoring {}%").format(restore_progress)
         self._restore_btn.set_text(text)
 
       elif restore_status == custom.BackupManagerSP.Status.failed:
