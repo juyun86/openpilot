@@ -72,7 +72,9 @@ class SoftwareLayout(Widget):
     self._branch_btn.action_item.set_value(ui_state.params.get("UpdaterTargetBranch") or "")
     self._branch_dialog: MultiOptionDialog | None = None
 
+    self._proxy_panel = None
     self._scroller = Scroller([
+      button_item("Clash / 代理热点", "设置", callback=self._open_proxy),
       self._onroad_label,
       self._version_item,
       self._download_btn,
@@ -80,6 +82,13 @@ class SoftwareLayout(Widget):
       self._branch_btn,
       button_item(lambda: tr("Uninstall"), lambda: tr("UNINSTALL"), callback=self._on_uninstall),
     ], line_separator=True, spacing=0)
+
+  def _open_proxy(self):
+    if not ui_state.params.get_bool("IsOffroad"): return
+    if self._proxy_panel is None:
+      from openpilot.selfdrive.ui.layouts.settings.proxy import ProxyLayout
+      self._proxy_panel = ProxyLayout()
+    gui_app.push_widget(self._proxy_panel)
 
   def show_event(self):
     super().show_event()

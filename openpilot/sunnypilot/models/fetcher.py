@@ -9,6 +9,7 @@ import time
 import os
 from pathlib import Path
 import requests
+from openpilot.common.mihomo_proxy import download_proxies
 from requests.exceptions import (SSLError, RequestException, HTTPError)
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
@@ -178,7 +179,7 @@ class ModelFetcher:
     """
     model_url, _ = self.MODEL_SOURCES[source]
     try:
-      response = requests.get(model_url, timeout=10)
+      response = requests.get(model_url, timeout=10, proxies=download_proxies())
 
       # Explicitly handle 404 differently
       if response.status_code == 404:
