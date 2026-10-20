@@ -1,3 +1,11 @@
+# 火星分支（C3）
+
+本仓库的 `dev-sp` 为**火星分支**，用于本次 C3 调试与维护。
+
+基于 `onemiless/openpilot` 的 `dev-sp`，包含中文界面补齐、Clash 全局 TUN、手机扫码添加订阅及节点测速选择。模型名称保留原文。
+
+---
+
 ![](https://user-images.githubusercontent.com/47793918/233812617-beab2e71-57b9-479e-8bff-c3931347ca40.png)
 
 ## 🌞 What is sunnypilot?
