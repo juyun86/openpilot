@@ -10,7 +10,7 @@ def hotspot():
  a=addresses[0];assert a['local']=='192.168.43.1','请使用 C3 热点模式'
  return a['local'],str(ipaddress.ip_network(f"{a['local']}/{a['prefixlen']}",strict=False))
 def prepare():
- hotspot()
+ # Wi-Fi client mode is valid too: only add hotspot rules when its address exists.
  state=ROOT/'gateway_state.json'
  if not state.exists():state.write_text(json.dumps({'previous_forward':pathlib.Path('/proc/sys/net/ipv4/ip_forward').read_text().strip()}))
  if run('ip','link','show',DEV,check=False).returncode:
@@ -40,14 +40,15 @@ def stopcore():
  except (OSError,ValueError):pass
  finally:(ROOT/'pid').unlink(missing_ok=True)
 def enable():
- _,network=hotspot()
- run('ip','route','replace',network,'dev','wlan0','table',TABLE)
+ try: _,network=hotspot()
+ except (RuntimeError,AssertionError):network=None
+ if network:run('ip','route','replace',network,'dev','wlan0','table',TABLE)
  run('ip','route','replace','default','dev',DEV,'table',TABLE)
- if 'iif wlan0' not in run('ip','rule','show').stdout:
+ if network and 'iif wlan0' not in run('ip','rule','show').stdout:
   run('ip','rule','add','priority',PRIORITY,'iif','wlan0','lookup',TABLE)
  run(IPT,'-t','nat','-N',CHAIN,check=False);run(IPT,'-t','nat','-F',CHAIN)
  for protocol in ('udp','tcp'):run(IPT,'-t','nat','-A',CHAIN,'-p',protocol,'--dport','53','-j','REDIRECT','--to-ports','17893')
- rules=[['-t','nat','PREROUTING','-i','wlan0','-j',CHAIN],['-t','filter','FORWARD','-i','wlan0','-o',DEV,'-j','ACCEPT'],['-t','filter','FORWARD','-i',DEV,'-o','wlan0','-j','ACCEPT']]
+ rules=[['-t','nat','PREROUTING','-i','wlan0','-j',CHAIN],['-t','filter','FORWARD','-i','wlan0','-o',DEV,'-j','ACCEPT'],['-t','filter','FORWARD','-i',DEV,'-o','wlan0','-j','ACCEPT']] if network else []
  for rule in rules:
   prefix=rule[:2];rest=rule[2:]
   if run(IPT,*prefix,'-C',*rest,check=False).returncode:run(IPT,*prefix,'-I',*rest)
