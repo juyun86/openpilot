@@ -3,6 +3,7 @@ import queue
 import subprocess
 import threading
 import time
+from pathlib import Path
 import pyray as rl
 from openpilot.system.ui.lib import application as ui_application
 from openpilot.common.params import Params
@@ -10,6 +11,8 @@ from openpilot.system.ui.lib.application import gui_app, FontWeight, font_fallba
 from openpilot.system.ui.widgets import Widget, DialogResult
 from openpilot.system.ui.widgets.button import Button
 from openpilot.system.ui.widgets.keyboard import Keyboard
+from openpilot.system.ui.lib.font_characters import fallback_font_characters
+from openpilot.system.ui.lib.multilang import multilang
 
 MANAGER = '/data/openpilot/openpilot/selfdrive/ui/mihomo_manager.py'
 PAIR = '/data/openpilot/openpilot/selfdrive/ui/mihomo_pair.py'
@@ -20,6 +23,15 @@ class ProxyLayout(Widget):
     ui_application.EXTRA_FONT_CHARS += '败板保备本别并不操测插查超车成持出传此存打大代带当导到的点订动读对二发返方分辅该公功过合和核后候换回或击机集加驾兼剪检件建键将接节仅局开可空理立连链量流络码没面模幕内能盘配屏启前切请取全确热认仍容入软扫尚稍设生失十时识使驶式试是手输所态添贴停同退完网维为未文下先效校新行选验页一已用有于与阅运在载择粘正支知直止置中钟重助转状走组作'
     self._previous_fallback_fonts = list(gui_app._fallback_fonts.values())
     gui_app._fallback_fonts.clear()
+    full_font = Path('/data/mihomo/NotoSansCJKsc-Regular.otf')
+    if multilang.language == 'zh-CHS' and full_font.exists():
+      chars = fallback_font_characters('zh-CHS', ui_application.EXTRA_FONT_CHARS)
+      codepoints = sorted(map(ord, chars))
+      data = rl.ffi.new('int[]', codepoints)
+      font = rl.load_font_ex(str(full_font), 48, data, len(codepoints))
+      rl.gen_texture_mipmaps(font.texture)
+      rl.set_texture_filter(font.texture, rl.TextureFilter.TEXTURE_FILTER_TRILINEAR)
+      gui_app._fallback_fonts['zh-CHS'] = font
     self._params = Params(); self._queue = queue.Queue(); self._busy = False
     self._status = {}; self._message = '手机连接 C3 热点，点击手机扫码添加订阅'
     self._last = 0.; self._qr = None; self._expires = 0.
