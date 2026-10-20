@@ -22,6 +22,9 @@ class ProxyLayout(Widget):
     super().__init__()
     ui_application.EXTRA_FONT_CHARS += '败板保备本表别并不部操测插查超车成迟持出传此存打大代带当导到的低点订动读对二发返方非分辅该高个公功共过合和核后候换回或击机即集加驾兼剪检件建键将接节仅局开可空快宽理立连链量列流络码没面模幕内能排盘配屏启前切请取全确热认仍容入软扫上尚稍设生失十时识使驶式试是手输速所态添贴停同退完网维为未文下先效校新行选延验页一已用有于与阅运在载择粘正支知直止置中钟重助转状走组最作'
     ui_application.EXTRA_FONT_CHARS += '败板保备本别并不操测插查超车成持出传此存打大代带当导到的点订动读对二发返方分辅该公功过合和核后候换回或击机集加驾兼剪检件建键将接节仅局开可空理立连链量流络码没面模幕内能盘配屏启前切请取全确热认仍容入软扫尚稍设生失十时识使驶式试是手输所态添贴停同退完网维为未文下先效校新行选验页一已用有于与阅运在载择粘正支知直止置中钟重助转状走组作'
+    try:
+      ui_application.EXTRA_FONT_CHARS += ''.join(set(c for c in Path('/data/mihomo/config.yaml').read_text()[:2000000] if ord(c)>127))
+    except OSError: pass
     self._previous_fallback_fonts = list(gui_app._fallback_fonts.values())
     gui_app._fallback_fonts.clear()
     full_font = Path('/data/mihomo/NotoSansCJKsc-Regular.otf')
