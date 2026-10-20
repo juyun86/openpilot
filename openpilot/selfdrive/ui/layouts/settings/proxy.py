@@ -20,6 +20,7 @@ PAIR = '/data/openpilot/openpilot/selfdrive/ui/mihomo_pair.py'
 class ProxyLayout(Widget):
   def __init__(self):
     super().__init__()
+    ui_application.EXTRA_FONT_CHARS += '败板保备本表别并不部操测插查超车成迟持出传此存打大代带当导到的低点订动读对二发返方非分辅该高个公功共过合和核后候换回或击机即集加驾兼剪检件建键将接节仅局开可空快宽理立连链量列流络码没面模幕内能排盘配屏启前切请取全确热认仍容入软扫上尚稍设生失十时识使驶式试是手输速所态添贴停同退完网维为未文下先效校新行选延验页一已用有于与阅运在载择粘正支知直止置中钟重助转状走组最作'
     ui_application.EXTRA_FONT_CHARS += '败板保备本别并不操测插查超车成持出传此存打大代带当导到的点订动读对二发返方分辅该公功过合和核后候换回或击机集加驾兼剪检件建键将接节仅局开可空理立连链量流络码没面模幕内能盘配屏启前切请取全确热认仍容入软扫尚稍设生失十时识使驶式试是手输所态添贴停同退完网维为未文下先效校新行选验页一已用有于与阅运在载择粘正支知直止置中钟重助转状走组作'
     self._previous_fallback_fonts = list(gui_app._fallback_fonts.values())
     gui_app._fallback_fonts.clear()
@@ -43,12 +44,15 @@ class ProxyLayout(Widget):
       Button('读取剪贴板', self._paste, font_size=45),
       Button('启动全局 TUN', lambda: self._run('start'), font_size=45),
       Button('停止代理', lambda: self._run('stop'), font_size=45),
-      Button('切换节点', lambda: self._run('next'), font_size=45),
+      Button('节点列表 / 测速', self._open_nodes, font_size=45),
       Button('测试 GitHub', lambda: self._run('test'), font_size=45),
     ]
 
   def _allowed(self):
     return self._params.get_bool('IsOffroad') and not self._params.get_bool('IsEngaged')
+
+  def _open_nodes(self):
+    if not self._busy: gui_app.push_widget(NodePicker())
 
   def _run(self, operation, value=None):
     if self._busy: return
@@ -120,3 +124,60 @@ class ProxyLayout(Widget):
       rl.draw_texture_pro(self._qr, rl.Rectangle(0, 0, self._qr.width, self._qr.height), rl.Rectangle(rect.x+rect.width-640, rect.y+245, size, size), rl.Vector2(0, 0), 0., rl.WHITE)
       text('二维码有效十分钟；请用手机扫码', 930, 34, rl.GRAY)
     text('全局 TUN：C3 和热点设备公网流量走所选节点', 990, 32, rl.GRAY)
+
+class NodePicker(Widget):
+  def __init__(self):
+    super().__init__()
+    self._rows=[]; self._page=0; self._busy=False; self._queue=queue.Queue()
+    self._message='测试的是连接延迟，非下载带宽；超时节点排在后面'
+    self._back=Button('返回', lambda: gui_app.pop_widget(), font_size=42)
+    self._measure=Button('全部测速', lambda:self._run('measure'), font_size=42)
+    self._fastest=Button('测速并选最快', lambda:self._run('fastest'), font_size=42)
+    self._prev=Button('上一页', lambda:self._turn(-1), font_size=40)
+    self._next=Button('下一页', lambda:self._turn(1), font_size=40)
+    self._buttons=[Button('',lambda i=i:self._choose(i),font_size=36) for i in range(7)]
+    self._run('nodes')
+
+  def _turn(self, step):
+    self._page=max(0,min((max(1,len(self._rows))-1)//7,self._page+step))
+
+  def _choose(self,i):
+    index=self._page*7+i
+    if index<len(self._rows):self._run('select',self._rows[index]['name'])
+
+  def _run(self,command,value=None):
+    if self._busy:return
+    params=Params()
+    if not params.get_bool('IsOffroad') or params.get_bool('IsEngaged'):return
+    self._busy=True; self._message='测速中，请稍候…' if command in ('measure','fastest') else '读取 / 切换节点中…'
+    def worker():
+      try:
+        p=subprocess.run(['/usr/bin/python3',MANAGER,command],input=value,capture_output=True,text=True,timeout=180)
+        data=json.loads(p.stdout.splitlines()[-1])
+      except Exception:data={'error':'操作失败，请确认代理已启动后重试'}
+      self._queue.put(data)
+    threading.Thread(target=worker,daemon=True).start()
+
+  def _render(self,rect):
+    while not self._queue.empty():
+      data=self._queue.get();self._busy=False
+      if data.get('error'):self._message=data['error']
+      else:
+        self._rows=data.get('nodes',[]);self._message='点击节点即可选用；最低延迟不代表最高带宽'
+    rl.draw_rectangle_rec(rect,rl.Color(25,29,38,255))
+    font=font_fallback(gui_app.font(FontWeight.NORMAL))
+    def label(text,x,y,size=38):rl.draw_text_ex(font,text,rl.Vector2(rect.x+x,rect.y+y),size,0,rl.WHITE)
+    label('节点选择与连接测速',30,20,60)
+    for b,x,w in [(self._measure,30,380),(self._fastest,440,480),(self._back,rect.width-280,240)]:
+      b.set_enabled(not self._busy);b.render(rl.Rectangle(rect.x+x,rect.y+110,w,85))
+    for i,b in enumerate(self._buttons):
+      index=self._page*7+i
+      if index>=len(self._rows):continue
+      r=self._rows[index];delay=f"{r['delay']} ms" if r.get('delay') else ('超时 / 不可用' if r.get('tested') else '未测速')
+      selected='[当前] ' if r.get('selected') else ''
+      b.set_text(selected+r['name'][:60]+'    '+delay)
+      b.set_enabled(not self._busy);b.render(rl.Rectangle(rect.x+30,rect.y+220+i*91,rect.width-60,78))
+    for b,x in [(self._prev,30),(self._next,rect.width-350)]:
+      b.set_enabled(not self._busy);b.render(rl.Rectangle(rect.x+x,rect.y+875,320,80))
+    label(f'{self._page+1} / {max(1,(len(self._rows)+6)//7)} 页 · 共 {len(self._rows)} 个节点',430,895,36)
+    label(self._message[:60],30,980,32)

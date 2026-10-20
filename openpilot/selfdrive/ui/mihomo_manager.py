@@ -11,6 +11,7 @@ import time
 import urllib.parse
 import urllib.request
 import yaml
+from concurrent.futures import ThreadPoolExecutor
 
 ROOT = Path('/data/mihomo')
 CORE = ROOT / 'mihomo'
@@ -88,12 +89,12 @@ def pid():
   except (OSError, ValueError): pass
   return None
 
-def api(path, payload=None):
+def api(path, payload=None, timeout=4):
   headers = {'Authorization': 'Bearer ' + (ROOT / 'secret').read_text().strip()}
   data = None if payload is None else json.dumps(payload).encode()
   if data: headers['Content-Type'] = 'application/json'
   req = urllib.request.Request('http://127.0.0.1:17891' + path, data=data, headers=headers, method='GET' if payload is None else 'PUT')
-  with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=4) as response:
+  with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout) as response:
     content = response.read(); return json.loads(content) if content else {}
 
 def stop():
@@ -137,6 +138,40 @@ def status():
     result['groups'] = [{'name': name, 'now': p.get('now', ''), 'all': p.get('all', [])} for name, p in api('/proxies').get('proxies', {}).items() if p.get('type') == 'Selector' and name != 'GLOBAL']
   return result
 
+def node_list():
+  proxies = api('/proxies').get('proxies', {})
+  group = proxies.get('C3-PROXY', {})
+  try: cached = json.loads((ROOT/'latency.json').read_text()).get('results', {})
+  except (OSError, ValueError): cached = {}
+  names = group.get('all', [])
+  rows = [{'name': n, 'delay': cached.get(n), 'tested': n in cached, 'selected': n == group.get('now')} for n in names if proxies.get(n, {}).get('type', '').lower() not in ('direct', 'reject', 'rejectdrop')]
+  rows.sort(key=lambda r: (r['delay'] is None, r['delay'] or 0, r['name']))
+  return {'nodes': rows, 'selected': group.get('now'), 'running': bool(pid())}
+
+def measure_nodes(select_best=False):
+  names = [r['name'] for r in node_list()['nodes']]
+  assert names, '没有可测试节点，请先启动并加载订阅'
+  def measure(name):
+    query = urllib.parse.urlencode({'url': 'https://www.gstatic.com/generate_204', 'timeout': 4000})
+    try:
+      delay = api('/proxies/'+urllib.parse.quote(name, safe='')+'/delay?'+query, timeout=6).get('delay')
+      return name, delay if isinstance(delay, (int,float)) and delay > 0 else None
+    except Exception: return name, None
+  with ThreadPoolExecutor(max_workers=8) as pool: results = dict(pool.map(measure, names))
+  (ROOT/'latency.json').write_text(json.dumps({'time': time.time(), 'results': results}))
+  good = [(delay, n) for n, delay in results.items() if delay is not None]
+  if select_best:
+    assert good, '全部节点连接失败，已保留原选择；请检查上游网络或订阅'
+    select_node(min(good)[1])
+  return node_list()
+
+def select_node(name):
+  names = api('/proxies').get('proxies', {}).get('C3-PROXY', {}).get('all', [])
+  assert name in names, '节点已变更，请刷新列表'
+  api('/proxies/C3-PROXY', {'name': name})
+  api('/proxies/GLOBAL', {'name': 'C3-PROXY'})
+  return node_list()
+
 def main(command):
   if command == 'status': return status()
   parked()
@@ -169,6 +204,10 @@ def main(command):
         raise
     elif command == 'start': start()
     elif command == 'stop': stop()
+    elif command == 'nodes': return node_list()
+    elif command == 'measure': return measure_nodes()
+    elif command == 'fastest': return measure_nodes(select_best=True)
+    elif command == 'select': return select_node(sys.stdin.read(4096).strip())
     elif command == 'next':
       groups = status()['groups']; assert groups, '请先启动代理并加载节点'
       g = groups[0]; choices = g['all']; assert choices, '没有可选节点'
