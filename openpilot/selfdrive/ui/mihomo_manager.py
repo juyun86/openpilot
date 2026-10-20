@@ -70,7 +70,7 @@ def normalize(raw):
   for k in ['listeners', 'external-controller-unix', 'external-controller-pipe', 'external-controller-tls', 'external-ui-url', 'external-ui-name', 'authentication', 'iptables', 'routing-mark']:
     d.pop(k, None)
   secret = (ROOT / 'secret').read_text().strip()
-  d.update({'mixed-port': 17890, 'port': 0, 'socks-port': 0, 'redir-port': 0, 'tproxy-port': 0, 'allow-lan': False, 'bind-address': '127.0.0.1', 'external-controller': '127.0.0.1:17891', 'external-ui': '', 'secret': secret, 'tun': {'enable': True, 'device': 'c3mh0', 'stack': 'gvisor', 'auto-route': False, 'auto-detect-interface': False, 'mtu': 1500}, 'dns': {'enable': True, 'listen': '192.168.43.1:17893', 'enhanced-mode': 'redir-host', 'default-nameserver': ['223.5.5.5', '119.29.29.29'], 'proxy-server-nameserver': ['223.5.5.5', '119.29.29.29'], 'nameserver': ['https://1.1.1.1/dns-query#C3-PROXY']}, 'ipv6': False, 'log-level': 'warning', 'find-process-mode': 'off', 'mode': 'rule'})
+  d.update({'mixed-port': 17890, 'port': 0, 'socks-port': 0, 'redir-port': 0, 'tproxy-port': 0, 'allow-lan': False, 'bind-address': '127.0.0.1', 'external-controller': '127.0.0.1:17891', 'external-ui': '', 'secret': secret, 'tun': {'enable': True, 'device': 'c3mh0', 'stack': 'gvisor', 'auto-route': False, 'auto-detect-interface': False, 'mtu': 1500}, 'dns': {'enable': True, 'listen': '0.0.0.0:17893', 'enhanced-mode': 'redir-host', 'default-nameserver': ['223.5.5.5', '119.29.29.29'], 'proxy-server-nameserver': ['223.5.5.5', '119.29.29.29'], 'nameserver': ['https://1.1.1.1/dns-query#C3-PROXY']}, 'ipv6': False, 'log-level': 'warning', 'find-process-mode': 'off', 'mode': 'global'})
   for kind in ('proxy-providers', 'rule-providers'):
     for i, provider in enumerate(d.get(kind, {}).values()):
       if isinstance(provider, dict): provider['path'] = f'./providers/{kind}-{i}.yaml'
@@ -99,28 +99,22 @@ def api(path, payload=None):
 def stop():
   (ROOT / 'enabled').unlink(missing_ok=True)
   if (ROOT / 'gateway_state.json').exists(): gateway('disable')
-  if p := pid():
-    os.kill(p, signal.SIGTERM)
-    for _ in range(30):
-      if not pid(): break
-      time.sleep(.1)
-    else: raise RuntimeError('代理进程尚未退出')
+  if pid(): gateway('stopcore')
 
 def start():
   if pid(): return
   assert CONFIG.exists(), '请先添加订阅或节点'
   use_tun = yaml.safe_load(CONFIG.read_text()).get('tun', {}).get('enable', False)
   if use_tun: gateway('prepare')
-  with (ROOT / 'core.log').open('ab') as log:
-    p = subprocess.Popen([str(CORE), '-d', str(ROOT), '-f', str(CONFIG)], stdout=log, stderr=log, start_new_session=True)
-  (ROOT / 'pid').write_text(str(p.pid))
+  gateway('startcore')
   for _ in range(30):
-    if p.poll() is not None:
+    if not pid():
       stop(); raise RuntimeError('内核启动失败，请检查配置或网络')
     try: api('/version')
     except Exception:
       time.sleep(.1); continue
     try:
+      api('/proxies/GLOBAL', {'name': 'C3-PROXY'})
       if use_tun:
         for _ in range(20):
           try:

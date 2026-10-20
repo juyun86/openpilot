@@ -25,7 +25,7 @@ class ProxyLayout(Widget):
       Button('输入 / 粘贴订阅', self._edit, font_size=45),
       Button('手机扫码添加', lambda: self._run('pair'), font_size=45),
       Button('读取剪贴板', self._paste, font_size=45),
-      Button('启动代理热点', lambda: self._run('start'), font_size=45),
+      Button('启动全局 TUN', lambda: self._run('start'), font_size=45),
       Button('停止代理', lambda: self._run('stop'), font_size=45),
       Button('切换节点', lambda: self._run('next'), font_size=45),
       Button('测试 GitHub', lambda: self._run('test'), font_size=45),
@@ -88,7 +88,7 @@ class ProxyLayout(Widget):
     text('Clash / mihomo', 15, 65)
     self._back.set_enabled(not self._busy)
     self._back.render(rl.Rectangle(rect.x+rect.width-300, rect.y+25, 260, 85))
-    state = '热点代理已启动' if self._status.get('gateway') else ('本机代理已启动' if self._status.get('running') else '未启动')
+    state = '全局 TUN 已启动' if self._status.get('gateway') else ('本机代理已启动' if self._status.get('running') else '未启动')
     text(f"状态：{state}     已保存节点：{self._status.get('nodes', 0)}", 105, 43)
     groups = self._status.get('groups') or []
     selected = groups[0]['now'] if groups else '尚未选择'
@@ -103,4 +103,4 @@ class ProxyLayout(Widget):
       size = min(560., rect.height-360.)
       rl.draw_texture_pro(self._qr, rl.Rectangle(0, 0, self._qr.width, self._qr.height), rl.Rectangle(rect.x+rect.width-640, rect.y+245, size, size), rl.Vector2(0, 0), 0., rl.WHITE)
       text('二维码有效十分钟；请用手机扫码', 930, 34, rl.GRAY)
-    text('C3 更新和模型下载 + 热点设备流量；上网需要有效节点', 990, 32, rl.GRAY)
+    text('全局 TUN：C3 和热点设备公网流量走所选节点', 990, 32, rl.GRAY)
