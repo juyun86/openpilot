@@ -76,8 +76,8 @@ class SoftwareLayoutSP(SoftwareLayout):
 
     folders = [
       TreeFolder("", top_level_nodes),
-      TreeFolder("Prebuilt Branches", prebuilt_nodes),
-      TreeFolder("Non-Prebuilt Branches", non_prebuilt_nodes),
+      TreeFolder(tr("Prebuilt Branches"), prebuilt_nodes),
+      TreeFolder(tr("Non-Prebuilt Branches"), non_prebuilt_nodes),
     ]
 
     def _on_branch_selected(result):
