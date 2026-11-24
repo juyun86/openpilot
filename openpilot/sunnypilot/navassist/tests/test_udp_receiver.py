@@ -49,6 +49,7 @@ def test_udp_accepts_canonical_v3_snapshot_without_credentials():
       "schemaVersion": 3,
       "sessionId": "session-a",
       "sequence": 1,
+      "modelRouteRevision": -1,
     }
     assert store.current().snapshot.session_id == "session-a"
     assert server.diagnostics()['accepted'] == 1
@@ -116,6 +117,7 @@ def test_extended_ack_preserves_legacy_packet_and_stays_below_mtu():
     new = json.loads(extended)
     old = json.loads(legacy)
     assert new.pop("vehicleTelemetry")["gpsStatus"] == "missing"
+    assert new.pop("modelRouteRevision") == -1
     assert new == old
     assert set(old) == {"messageType", "schemaVersion", "sessionId", "sequence", "vehicleLane"}
   finally:

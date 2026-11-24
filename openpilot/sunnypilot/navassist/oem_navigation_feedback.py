@@ -28,7 +28,11 @@ def bits(value: int, start: int, length: int, signed: bool = False) -> int:
 
 
 class OemNavigationFeedback:
-  def __init__(self):
+  def __init__(self, position_address: int = 0x04F):
+    if position_address not in (0x04F, 0x309):
+      raise ValueError("unsupported position address")
+    self._position_address = position_address
+    self._addresses = (position_address,) + ADDRESSES[1:] + GPS_DIAGNOSTIC_ADDRESSES
     self._lock = threading.Lock()
     self._frames: dict[int, tuple[int, int | None, str]] = {}
     self._position_anchor: tuple[int, float, float] | None = None
@@ -47,7 +51,7 @@ class OemNavigationFeedback:
       for frame in frames:
         address = int(frame.address)
         expected_bus = 2 if address == 0x32B else 1
-        if int(frame.src) != expected_bus or address not in ADDRESSES + GPS_DIAGNOSTIC_ADDRESSES:
+        if int(frame.src) != expected_bus or address not in self._addresses:
           continue
         if not 0 < now_ns <= received_ns or received_ns - now_ns > INGRESS_MAX_AGE_NS:
           continue  # Do not refresh observations from delayed/future events.
@@ -70,10 +74,10 @@ class OemNavigationFeedback:
           elif value < self._gps_time_value:
             value, status = None, "invalid"
           # Repeated CAN delivery of the same clock value cannot renew its age.
-        elif value is not None and address == 0x04F:
+        elif value is not None and address == self._position_address:
           lat, lon = bits(value, 0, 28, True) * 1e-6, bits(value, 28, 29, True) * 1e-6
           accuracy = bits(value, 57, 7)
-          if not (-90 <= lat <= 90 and -180 <= lon <= 180) or accuracy in (0, 127):
+          if not (-90 <= lat <= 90 and -180 <= lon <= 180) or accuracy in (0, 127) or (address == 0x309 and lat == 0 and lon == 0):
             value, status = None, "invalid"
           else:
             anchor = self._position_anchor
@@ -98,12 +102,12 @@ class OemNavigationFeedback:
         frame = self._frames.get(address)
         if frame is None:
           return None, "missing"
-        budget = GPS_MAX_AGE_NS if address in (0x04F, 0x2F8) + GPS_DIAGNOSTIC_ADDRESSES else DEBUG_MAX_AGE_NS
+        budget = GPS_MAX_AGE_NS if address in (self._position_address, 0x2F8) + GPS_DIAGNOSTIC_ADDRESSES else DEBUG_MAX_AGE_NS
         if not 0 <= now_ns - frame[0] < budget:
           return None, "stale"
         return frame[1], frame[2]
 
-      position, position_status = fresh(0x04F)
+      position, position_status = fresh(self._position_address)
       motion, motion_status = fresh(0x2F8)
       autopilot, _ = fresh(0x247)
       visual, _ = fresh(0x24A)
@@ -129,7 +133,7 @@ class OemNavigationFeedback:
         # Diagnostic source ages, not a guarantee of GNSS measurement coherence.
         "gpsTimeMs": gps_time if time_current else None,
         "gpsTimeAgeMs": time_age_ns // 1_000_000 if time_current else None,
-        "gpsPositionAgeMs": age_ms(0x04F),
+        "gpsPositionAgeMs": age_ms(self._position_address),
         "gpsMotionAgeMs": age_ms(0x2F8),
         "gpsAccuracyRaw": self._accuracy_raw if accuracy is not None else None,
         "gpsAccuracyAgeMs": age_ms(0x32B),

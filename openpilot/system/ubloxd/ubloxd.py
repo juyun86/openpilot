@@ -11,6 +11,7 @@ from openpilot.cereal import messaging
 from openpilot.system.ubloxd.ubx import Ubx
 from openpilot.system.ubloxd.gps import Gps
 from openpilot.system.ubloxd.glonass import Glonass
+from openpilot.sunnypilot.navassist.vehicle_gps_position import VehicleGpsPosition
 
 
 SECS_IN_MIN = 60
@@ -508,6 +509,7 @@ class UbloxMsgParser:
 
 def main():
   parser = UbloxMsgParser()
+  vehicle_position = VehicleGpsPosition()
   pm = messaging.PubMaster(['ubloxGnss', 'gpsLocationExternal'])
   sock = messaging.sub_sock('ubloxRaw', timeout=100, conflate=False)
 
@@ -527,6 +529,8 @@ def main():
       if not res:
         continue
       service, dat = res
+      if service == 'gpsLocationExternal':
+        vehicle_position.apply(dat.gpsLocationExternal)
       pm.send(service, dat)
 
 

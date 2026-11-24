@@ -136,6 +136,7 @@ class NavAssistSnapshot:
   lane_guidance_observed_at_ms: int
   lanes: tuple[LaneGuidance, ...]
   lane_change_speech_completed_id: str = ""
+  maneuver_distance_present: bool = False
 
 
 @dataclass(frozen=True)
@@ -362,6 +363,7 @@ def parse_snapshot(body: bytes) -> NavAssistSnapshot:
     maneuver=maneuver,
     guidance_observed_at_ms=guidance_observed_at_ms,
     maneuver_distance_m=float(_optional_integer(guidance, "maneuverDistanceM", 0, 100_000, default=0)),
+    maneuver_distance_present=guidance_present and guidance.get("maneuverDistanceM") is not None,
     next_maneuver=_enum(guidance, "nextManeuver", MANEUVER_VALUES, default="none"),
     next_maneuver_distance_m=float(_optional_integer(guidance, "nextManeuverDistanceM", 0, 100_000, default=0)),
     advisory_speed_mps=advisory_speed,
@@ -395,6 +397,7 @@ class NavAssistStore:
     self._checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
     self._lock = threading.Lock()
     self._current: AcceptedSnapshot | None = None
+    self._model_route = None
     self._retired_sessions: deque[str] = deque(maxlen=remembered_sessions)
     self._app_key_id: str | None = None
     self._active_session_id: str | None = None
@@ -503,6 +506,11 @@ class NavAssistStore:
             _reject("replay", "retired session cannot become active again")
           retired_sessions.append(self._active_session_id)
       self._save_checkpoint(app_key_id, snapshot.session_id, snapshot.sequence, snapshot.route_revision, retired_sessions)
+      if self._model_route is not None:
+        from openpilot.sunnypilot.navassist.nav_model_input import matches
+        if (self._app_key_id != app_key_id or self._current is None or self._current.is_stale(now_ns)
+            or not matches(self._model_route, accepted, now_ns)):
+          self._model_route = None
       self._app_key_id = app_key_id
       self._active_session_id = snapshot.session_id
       self._last_sequence = snapshot.sequence
@@ -514,6 +522,7 @@ class NavAssistStore:
   def reset(self) -> None:
     with self._lock:
       self._current = None
+      self._model_route = None
       self._app_key_id = None
       self._active_session_id = None
       self._last_sequence = 0
@@ -528,6 +537,38 @@ class NavAssistStore:
   def current(self, now_ns: int | None = None) -> AcceptedSnapshot | None:
     with self._lock:
       return self._current
+
+  def accept_model_route(self, body: bytes, app_key_id: str):
+    from openpilot.sunnypilot.navassist.nav_model_input import matches, parse_model_route
+    route = parse_model_route(body)
+    with self._lock:
+      if self._app_key_id != app_key_id:
+        _reject("authentication", "route sender is not the snapshot owner")
+      if (self._current is None or not matches(route, self._current, self._clock_ns())
+          or route.sequence > self._last_sequence
+          or not -MAX_SOURCE_FUTURE_SKEW_MS <= self._wall_clock_ms() - route.source_wall_time_ms <= MAX_SOURCE_AGE_MS):
+        _reject("replay", "route does not match fresh navigation")
+      if self._model_route is not None:
+        if route.sequence <= self._model_route.sequence:
+          _reject("replay", "route sequence must increase")
+        if route.points != self._model_route.points:
+          _reject("replay", "changed geometry requires a new route revision")
+      self._model_route = route
+      return route
+
+  def model_input(self, now_ns: int | None = None):
+    from openpilot.sunnypilot.navassist.nav_model_input import prepare_model_input
+    with self._lock:
+      if self._model_route is None or self._current is None:
+        return None
+      return prepare_model_input(self._model_route, self._current, self._clock_ns() if now_ns is None else now_ns)
+
+  def model_route_revision(self) -> int:
+    from openpilot.sunnypilot.navassist.nav_model_input import matches
+    with self._lock:
+      if self._model_route is not None and self._current is not None and matches(self._model_route, self._current, self._clock_ns()):
+        return self._model_route.route_revision
+      return -1
 
   def is_stale(self, now_ns: int | None = None) -> bool:
     current = self.current()

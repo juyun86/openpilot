@@ -7,7 +7,9 @@ See the LICENSE.md file in the root directory for more details.
 """
 
 from collections.abc import Callable
+from pathlib import Path
 import os
+import pickle
 os.environ['GMMU'] = '0'
 from openpilot.common.hardware import COMMA_HARDWARE
 from openpilot.selfdrive.modeld.helpers import chestnut_present
@@ -59,6 +61,8 @@ from openpilot.sunnypilot.modeld_v2.compile_modeld import (derive_frame_skip, ma
                                                            WARP_INPUTS, POLICY_INPUTS)
 from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
+from openpilot.sunnypilot.navassist.model_inputs import fill_navigation_inputs, model_navigation_inputs
+from openpilot.sunnypilot.modeld_v2.nav_runtime import NavigationRuntime
 from openpilot.sunnypilot.models.helpers import get_active_bundle
 from openpilot.sunnypilot.selfdrive.controls.lib.lane_change_blocker import (
   LaneChangeBoundaryBlocker,
@@ -201,6 +205,30 @@ class ModelState(ModelStateBase):
       loading_progress_callback(80)
 
     metadata = jits['metadata']
+    self.nav_runtime = None
+    if 'input_specs' in jits:
+      prefix = 'big_' if self.chestnut else ''
+      warp_path = Path(pkl_path).with_name(f'{prefix}driving_warp_{cam_w}x{cam_h}_tinygrad.pkl')
+      with open_file_chunked(warp_path) as warp_file:
+        warp = pickle.load(warp_file)['run']
+      self.nav_runtime = NavigationRuntime(jits, warp, nv12_copy_size(*get_nv12_info(cam_w, cam_h)[:3]))
+      self.numpy_inputs = self.npy = self.nav_runtime.npy
+      self.input_queues = self.nav_runtime.input_queues
+      self.input_shapes = self.nav_runtime.input_shapes
+      self.DEV = self.QUEUE_DEV = self.WARP_DEV = self.nav_runtime.model_device
+      self.frame_copy_size = self.nav_runtime.frame_copy_size
+      self.frame_buffers = {'img': self.nav_runtime.frames[0], 'big_img': self.nav_runtime.frames[1]}
+      self._vision_input_names, self._road_key, self._wide_key = ['img', 'big_img'], 'img', 'big_img'
+      self._desire_key, self._combined_model_type, self.is_run_model = 'desire', 'supercombo', True
+      self.vision_output_slices = self.nav_runtime.output_slices
+      self.policy_output_slices, self._policy_slices_list = {}, []
+      self.constants, self.parser, self.prev_desire = ModelConstants(), Parser(), self.nav_runtime.prev_desire
+      self.run_model = self.run_policy = self.warp = None
+      if self.chestnut:
+        self.warmup()
+      if loading_progress_callback is not None:
+        loading_progress_callback(95)
+      return
     self.WARP_DEV = metadata.get('warp_dev', 'QCOM') if COMMA_HARDWARE else 'CPU'
     self.DEV = ('AMD' if self.chestnut else 'QCOM') if COMMA_HARDWARE else 'CPU'
     self.QUEUE_DEV = self.DEV
@@ -271,6 +299,14 @@ class ModelState(ModelStateBase):
         loading_progress_callback(95)
 
   def warmup(self) -> None:
+    if self.nav_runtime is not None:
+      frames = {key: np.zeros(self.frame_copy_size, np.uint8) for key in self._vision_input_names}
+      eye = np.eye(3, dtype=np.float32)
+      inputs = {'desire': np.zeros(self.constants.DESIRE_LEN, np.float32),
+                'traffic_convention': np.zeros(2, np.float32), 'action_t': np.zeros(2, np.float32)}
+      self.run(frames, dict.fromkeys(self._vision_input_names, eye), inputs)
+      self.nav_runtime.reset()
+      return
     dummy_size = self.frame_copy_size if self.is_run_model else self.frame_buf_params[self._road_key][3]
     dummy_frames = {k: np.zeros(dummy_size, dtype=np.uint8) for k in self._vision_input_names}
     transforms = {k: np.eye(3, dtype=np.float32) for k in [self._road_key, self._wide_key] if k}
@@ -303,6 +339,10 @@ class ModelState(ModelStateBase):
   def run(self, bufs: dict[str, VisionBuf], transforms: dict[str, np.ndarray],
           inputs: dict[str, np.ndarray],
           after_enqueue: Callable[[], None] | None = None) -> dict[str, np.ndarray] | None:
+    if self.nav_runtime is not None:
+      raw = self.nav_runtime.run(bufs, transforms, inputs, after_enqueue)
+      sliced = {key: raw[np.newaxis, section] for key, section in self.vision_output_slices.items()}
+      return validate_model_outputs(chestnut=self.chestnut, outputs=self.parser.parse_outputs(sliced))
     if self.is_run_model:
       for key, buf in bufs.items():
         data = buf.data if hasattr(buf, 'data') else buf
@@ -323,6 +363,7 @@ class ModelState(ModelStateBase):
     for key in ('traffic_convention', 'lateral_control_params', 'action_t'):
       if key in self.numpy_inputs and key in inputs:
         self.numpy_inputs[key][:] = inputs[key]
+    fill_navigation_inputs(self.numpy_inputs, inputs)
 
     self.numpy_inputs['tfm'][:, :] = transforms[self._road_key].reshape(3, 3)
     self.numpy_inputs['big_tfm'][:, :] = transforms[self._wide_key].reshape(3, 3)
@@ -607,6 +648,13 @@ def main(demo=False):
 
     if 'lateral_control_params' in model.numpy_inputs:
       inputs['lateral_control_params'] = np.array([v_ego, lat_delay], dtype=np.float32)
+    if all(name in model.numpy_inputs for name in ('nav_map', 'navigation')):
+      inputs.update(model_navigation_inputs(
+        sm['navAssistStateSP'], now_ns=time.monotonic_ns(),
+        healthy=sm.all_checks(['navAssistStateSP', 'carState', 'carControl']),
+        control_active=sm['carControl'].latActive, turn_active=DH.turn_maneuver.state == 'active',
+        driver_override=sm['carState'].brakePressed or sm['carState'].steeringPressed or sm['carState'].gasPressed,
+      ))
 
     # Jetlink uses control state and dropped-frame share to decide safe handovers.
     model.in_control = jetlink_adapter.in_control(sm)

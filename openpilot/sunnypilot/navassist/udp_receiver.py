@@ -100,6 +100,7 @@ class NavAssistUDPServer:
       if self.ack_payload_provider is not None:
         acknowledgement_payload["vehicleLane"] = self.ack_payload_provider()
       acknowledgement = json.dumps(acknowledgement_payload, separators=(",", ":")).encode()
+      extended_ack_payload = {**acknowledgement_payload, "modelRouteRevision": self.store.model_route_revision()}
       decision = {}
       if self.lane_decision_provider is not None:
         try:
@@ -118,9 +119,12 @@ class NavAssistUDPServer:
           if (announcement and announcement.get('sessionId') == accepted.snapshot.session_id
               and accepted.snapshot.navigation_mode == 'realtime' and accepted.snapshot.route_active
               and not accepted.is_stale(time.monotonic_ns())):
-            extended = json.dumps({**acknowledgement_payload, **decision_payload,
+            extended = json.dumps({**extended_ack_payload, **decision_payload,
                                    'laneAnnouncement': announcement},
                                   separators=(',', ':'), allow_nan=False).encode()
+            if len(extended) > 1400:
+              extended = json.dumps({**acknowledgement_payload, **decision_payload, 'laneAnnouncement': announcement},
+                                    separators=(',', ':'), allow_nan=False).encode()
             if len(extended) <= 1400:
               self._socket.sendto(extended, address)
         except Exception:
@@ -129,16 +133,22 @@ class NavAssistUDPServer:
       # first, then the unchanged ACK; diagnostics must never prevent delivery.
       if self.telemetry_provider is not None:
         try:
+          telemetry = self.telemetry_provider()
           extended = json.dumps(
-            {**acknowledgement_payload, "vehicleTelemetry": self.telemetry_provider(),
+            {**extended_ack_payload, "vehicleTelemetry": telemetry,
              **decision_payload},
             separators=(",", ":"), allow_nan=False,
           ).encode()
+          if len(extended) > 1400:
+            extended = json.dumps({**acknowledgement_payload, "vehicleTelemetry": telemetry, **decision_payload},
+                                  separators=(",", ":"), allow_nan=False).encode()
           if len(extended) <= 1400:
             self._socket.sendto(extended, address)
         except Exception:
           self._reject_record('telemetryUnavailable')
       try:
+        if self.telemetry_provider is None:
+          self._socket.sendto(json.dumps(extended_ack_payload, separators=(",", ":")).encode(), address)
         self._socket.sendto(acknowledgement, address)
       except OSError:
         if self._stopping.is_set():

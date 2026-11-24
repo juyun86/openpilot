@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from openpilot.sunnypilot.navassist.identity import NavAssistDeviceIdentity, NavAssistPairingStore, verify_signature
 from openpilot.sunnypilot.navassist.protocol import MAX_BODY_BYTES, NavAssistProtocolError, NavAssistStore
+from openpilot.sunnypilot.navassist.nav_model_input import MAX_ROUTE_BYTES, ROUTE_PATH
 
 
 SNAPSHOT_PATH = "/v3/snapshot"
@@ -100,7 +101,7 @@ class NavAssistRequestHandler(BaseHTTPRequestHandler):
     self.wfile.write(body)
 
   def do_POST(self) -> None:
-    if self.path != SNAPSHOT_PATH:
+    if self.path not in (SNAPSHOT_PATH, ROUTE_PATH):
       self._respond(404, {"accepted": False, "reason": "not_found"})
       return
     if not self.server.rate_limiter.allow(self.client_address[0]):
@@ -116,21 +117,31 @@ class NavAssistRequestHandler(BaseHTTPRequestHandler):
       content_length = int(self.headers.get("Content-Length", "-1"))
     except ValueError:
       content_length = -1
-    if not 0 < content_length <= MAX_BODY_BYTES:
+    if not 0 < content_length <= (MAX_ROUTE_BYTES if self.path == ROUTE_PATH else MAX_BODY_BYTES):
       self._respond(413, {"accepted": False, "reason": "body_size"})
       return
     body = self.rfile.read(content_length)
     app_key_id = self.headers.get(KEY_ID_HEADER)
     app_public_key = self.server.pairing.public_key_for(app_key_id) if app_key_id is not None else None
     signature = self.headers.get(SIGNATURE_HEADER)
-    if app_public_key is None or signature is None or not verify_signature(
+    if self.path == ROUTE_PATH and not app_key_id and not signature:
+      # Reuse the existing data-only UDP source boundary. Store checks ownership
+      # and session atomically; malformed supplied credentials never fall back.
+      from openpilot.sunnypilot.navassist.udp_receiver import source_key_id
+      app_key_id = source_key_id(self.client_address[0])
+    elif app_public_key is None or signature is None or not verify_signature(
       app_public_key,
-      snapshot_signature_material(self.server.identity.device_id, app_key_id, SNAPSHOT_PATH, body),
+      snapshot_signature_material(self.server.identity.device_id, app_key_id, self.path, body),
       signature,
     ):
       self._respond(401, {"accepted": False, "reason": "authentication"})
       return
     try:
+      if self.path == ROUTE_PATH:
+        route = self.server.store.accept_model_route(body, app_key_id)
+        self._respond(202, {"accepted": True, "sessionId": route.session_id,
+                            "sequence": route.sequence, "routeRevision": route.route_revision})
+        return
       accepted = self.server.store.accept(body, app_key_id)
     except NavAssistProtocolError as error:
       status = 401 if error.reason == "authentication" else 409 if error.reason == "replay" else 400

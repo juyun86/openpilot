@@ -6,6 +6,8 @@ import os
 import tempfile
 import time
 import shutil
+import pickle
+from pathlib import Path
 from functools import partial
 from collections import namedtuple
 
@@ -134,6 +136,9 @@ def get_policy_npy_shapes(input_shapes):
   feat_dim = math.prod(fb[2:])
   # TODO prev_feat shouldn't exist and be handled inside the JIT, but corrupt on QCOM for now
   shapes = {'desire': (dp[2],), 'traffic_convention': tuple(tc), 'action_t': tuple(at), 'prev_feat': (fb[0], feat_dim)}
+  for name in ('nav_map', 'navigation'):
+    if name in input_shapes:
+      shapes[name] = tuple(input_shapes[name])
   return shapes, [math.prod(s) for s in shapes.values()]
 
 
@@ -208,7 +213,8 @@ def make_run_policy(model_runner, model_metadata, frame_skip):
     img = shift_and_sample(img_q, warped[0:1], sample_skip_fn)
     big_img = shift_and_sample(big_img_q, warped[1:2], sample_skip_fn)
 
-    desire, traffic_convention, action_t, prev_feat = (t.reshape(s) for t, s in zip(packed_npy_inputs.split(npy_sizes), npy_shapes.values(), strict=True))
+    policy_inputs = {name: t.reshape(s) for (name, s), t in zip(npy_shapes.items(), packed_npy_inputs.split(npy_sizes), strict=True)}
+    desire, traffic_convention, action_t, prev_feat = (policy_inputs[name] for name in ('desire', 'traffic_convention', 'action_t', 'prev_feat'))
     desire_buf = shift_and_sample(desire_q, desire.reshape(1, 1, -1), sample_desire_fn)
     feat_buf = shift_and_sample(feat_q, prev_feat.reshape(1, 1, -1), sample_skip_fn)
 
@@ -220,6 +226,7 @@ def make_run_policy(model_runner, model_metadata, frame_skip):
       'traffic_convention': traffic_convention,
       'action_t': action_t,
     }
+    inputs.update({name: policy_inputs[name] for name in ('nav_map', 'navigation') if name in policy_inputs})
     inputs = {name: value.cast(model_input_dtypes[name]) for name, value in inputs.items()}
     out = next(iter(model_runner(inputs).values())).cast('float32')
     return out,
@@ -303,6 +310,39 @@ def read_file_chunked_to_disk(path):
   return tmp_path
 
 
+def compile_navigation_bundle(model_runner, metadata, args):
+  from openpilot.sunnypilot.modeld_v2.nav_compile import compile_navigation_policy
+  from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
+  out = compile_navigation_policy(model_runner, metadata)
+  image_shape, image_dtype, _ = out['input_specs']['new_img']
+  model_w, model_h = args.model_size
+  if tuple(image_shape) != (2, 6, model_h // 2, model_w // 2):
+    raise ValueError('new_img shape does not match the existing camera warp layout')
+  output_path = Path(args.output)
+  prefix = 'big_' if output_path.name.startswith('big_') else ''
+  for cam_w, cam_h in args.camera_resolutions:
+    nv12 = NV12Frame(cam_w, cam_h, *get_nv12_info(cam_w, cam_h))
+    frame_size = nv12_copy_size(nv12.stride, nv12.y_height, nv12.uv_height)
+    prepare = make_warp(nv12, model_w, model_h)
+
+    def run_warp(input_frame, M_inv, _prepare=prepare):
+      return _prepare(M_inv[0], M_inv[1], input_frame[0], input_frame[1]).cast(image_dtype).realize()
+
+    warp = TinyJit(run_warp, prune=True)
+    frame = Tensor.zeros(2, frame_size, dtype='uint8', device=Device.DEFAULT).realize()
+    transforms = Tensor(np.stack([np.eye(3, dtype=np.float32)] * 2), device=Device.DEFAULT).realize()
+    for _ in range(3):
+      warped = warp(input_frame=frame, M_inv=transforms)
+      if warped.shape != tuple(image_shape):
+        raise ValueError('Compiled camera warp does not match new_img')
+    warp_path = output_path.with_name(f'{prefix}driving_warp_{cam_w}x{cam_h}_tinygrad.pkl')
+    with open(warp_path, 'wb') as f:
+      pickle.dump({'run': warp}, f, protocol=5)
+  with open(output_path, 'wb') as f:
+    dump_oob(out, f)
+  print(f'Saved navigation policy and camera warps beside {output_path}')
+
+
 if __name__ == "__main__":
   from tinygrad.nn.onnx import OnnxRunner
   from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
@@ -322,6 +362,9 @@ if __name__ == "__main__":
   model_w, model_h = args.model_size
 
   model_runner = OnnxRunner(model_path)
+  if 'new_img' in model_runner.graph_inputs:
+    compile_navigation_bundle(model_runner, make_metadata_dict(model_path), args)
+    raise SystemExit(0)
   out = {
     'metadata': make_metadata_dict(model_path),
     'input_devices': {'model': Device.DEFAULT},

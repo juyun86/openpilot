@@ -682,6 +682,10 @@ struct NavAssistStateSP @0xc2243c65e0340384 {
   laneChangeSpeechCompletedId @45 :Text;
   turnSignalHold @46 :Bool;  # Fresh App-owned red-light countdown asks the current maneuver lamp session to remain active.
   turnSignalCountdownS @47 :Int16 = -1;
+  modelMap @48 :Data;  # Optional 256x256 uint8 comma navigation map; absent on unavailable/stale input.
+  modelNavigation @49 :List(Float32);
+  modelMapMonoTime @50 :UInt64;
+  modelInputValid @51 :Bool;
 
   struct LaneGuidance {
     index @0 :UInt8;

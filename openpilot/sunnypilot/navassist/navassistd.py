@@ -20,6 +20,7 @@ from openpilot.sunnypilot.navassist.udp_receiver import NavAssistUDPServer, UDP_
 from openpilot.sunnypilot.navassist.diagnostics import ingress_status_path
 from openpilot.sunnypilot.navassist.settings import atomic_json
 from openpilot.sunnypilot.navassist.diagnostic_events import DiagnosticEvents
+from openpilot.sunnypilot.navassist.map_input import ModelMapWorker
 
 
 LISTEN_HOST = "0.0.0.0"
@@ -78,6 +79,7 @@ def main() -> None:
   pairing = NavAssistPairingStore(params)
 
   store = NavAssistStore(checkpoint_path=REPLAY_CHECKPOINT_PATH)
+  map_worker = ModelMapWorker()
   oem_lane_feedback = OemLaneFeedback()
   oem_navigation_feedback = OemNavigationFeedback()
   speech_feedback = {}
@@ -168,12 +170,16 @@ def main() -> None:
         except OSError:
           pass
       localization_valid = local_localization_valid(sm, now_ns)
+      model_input = store.model_input(now_ns)
+      map_frame = map_worker.update(model_input, now_ns)
       message = build_nav_assist_message(
         store.current(), now_ns, local_localization_valid=localization_valid,
+        model_input=model_input, map_frame=map_frame,
       )
       pm.send("navAssistStateSP", message)
       ratekeeper.keep_time()
   finally:
+    map_worker.close()
     if udp_started:
       udp_server.shutdown()
     if discovery_started:

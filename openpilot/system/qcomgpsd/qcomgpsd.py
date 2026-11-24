@@ -11,6 +11,7 @@ from typing import NoReturn
 from struct import unpack_from, calcsize, pack
 
 from openpilot.cereal import log
+from openpilot.sunnypilot.navassist.vehicle_gps_position import VehicleGpsPosition
 import openpilot.cereal.messaging as messaging
 from openpilot.common.gpio import gpio_init, gpio_set
 from openpilot.common.utils import retry
@@ -218,6 +219,7 @@ def main() -> NoReturn:
   gpio_set(GPIO.GNSS_PWR_EN, True)
 
   pm = messaging.PubMaster(['qcomGnss', 'gpsLocation'])
+  vehicle_position = VehicleGpsPosition()
 
   while 1:
     opcode, payload = diag.recv()
@@ -312,6 +314,7 @@ def main() -> NoReturn:
       gps.speedAccuracy = math.sqrt(sum([x**2 for x in vNEDsigma]))
       # quectel gps verticalAccuracy is clipped to 500, set invalid if so
       gps.hasFix = gps.verticalAccuracy != 500
+      vehicle_position.apply(gps)
       pm.send('gpsLocation', msg)
 
     elif log_type == LOG_GNSS_OEMDRE_SVPOLY_REPORT:

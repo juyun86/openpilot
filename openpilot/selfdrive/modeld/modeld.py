@@ -3,6 +3,7 @@ from collections.abc import Callable
 import ctypes
 from functools import cached_property
 import os
+import pickle
 os.environ['GMMU'] = '0' # for chestnut fast loading, noop for qcom
 from openpilot.common.hardware import COMMA_HARDWARE
 from openpilot.sunnypilot.hardware.profile import HardwareProfile, get_hardware_profile
@@ -49,6 +50,8 @@ from openpilot.sunnypilot.selfdrive.controls.lib.lane_change_blocker import (
   nav_lane_crossing_policy,
 )
 from openpilot.sunnypilot.selfdrive.controls.lib.relc import RoadEdgeLaneChangeController
+from openpilot.sunnypilot.navassist.model_inputs import fill_navigation_inputs, model_navigation_inputs
+from openpilot.sunnypilot.modeld_v2.nav_runtime import NavigationRuntime
 
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 
@@ -166,6 +169,18 @@ class ModelState(ModelStateBase):
   def __init__(self, cam_w: int, cam_h: int, chestnut: bool):
     ModelStateBase.__init__(self)
     jits = load_oob(open_file_chunked(modeld_pkl_path(chestnut)))
+    self.nav_runtime = None
+    if 'input_specs' in jits:
+      prefix = 'big_' if chestnut else ''
+      warp_path = modeld_pkl_path(chestnut).with_name(f'{prefix}driving_warp_{cam_w}x{cam_h}_tinygrad.pkl')
+      with open_file_chunked(warp_path) as warp_file:
+        warp = pickle.load(warp_file)['run']
+      self.nav_runtime = NavigationRuntime(jits, warp, nv12_copy_size(*get_nv12_info(cam_w, cam_h)[:3]))
+      self.model_device, self.npy = self.nav_runtime.model_device, self.nav_runtime.npy
+      self.vision_input_names = ['img', 'big_img']
+      self.chestnut, self.parser = chestnut, Parser()
+      self.frame_copy_size, self.output_slices = self.nav_runtime.frame_copy_size, self.nav_runtime.output_slices
+      return
     input_devices = jits['input_devices']
     self.model_device = input_devices['model']
     metadata = jits['metadata']
@@ -189,6 +204,14 @@ class ModelState(ModelStateBase):
 
   def run(self, bufs: dict[str, VisionBuf], transforms: dict[str, np.ndarray],
           inputs: dict[str, np.ndarray], after_enqueue: Callable[[], None] | None = None) -> dict[str, np.ndarray]:
+    if self.nav_runtime is not None:
+      raw = self.nav_runtime.run(bufs, transforms, inputs, after_enqueue)
+      if self.chestnut and not np.all(np.isfinite(raw)):
+        raise RuntimeError('model output not finite')
+      outputs = self.parser.parse_outputs(self.slice_outputs(raw, self.output_slices))
+      if SEND_RAW_PRED:
+        outputs['raw_pred'] = raw.copy()
+      return outputs
     for key, buf in bufs.items():
       np.copyto(self.frame_views[key], np.frombuffer(buf.data, dtype=np.uint8, count=self.frame_copy_size))
 
@@ -198,6 +221,7 @@ class ModelState(ModelStateBase):
     self.prev_desire[:] = inputs['desire_pulse']
     self.npy['traffic_convention'][:] = inputs['traffic_convention']
     self.npy['action_t'][:] = inputs['action_t']
+    fill_navigation_inputs(self.npy, inputs)
     self.npy['tfm'][:,:] = transforms['img'][:,:]
     self.npy['big_tfm'][:,:] = transforms['big_img'][:,:]
 
@@ -219,6 +243,9 @@ class ModelState(ModelStateBase):
     eye = np.eye(3, dtype=np.float32)
     dims = {'desire_pulse': ModelConstants.DESIRE_LEN, 'traffic_convention': 2, 'action_t': 2}
     self.run(dummy_frames, dict.fromkeys(self.vision_input_names, eye), {k: np.zeros(v, dtype=np.float32) for k, v in dims.items()})
+    if self.nav_runtime is not None:
+      self.nav_runtime.reset()
+      return
     self.input_queues, self.npy, self.frame_views = make_input_queues(
       self.input_shapes, self.frame_skip, device=self.model_device, frame_copy_size=self.frame_copy_size)
     self.prev_desire[:] = 0
@@ -439,6 +466,13 @@ def main(demo=False):
       'traffic_convention': traffic_convention,
       'action_t': np.array([lat_action_t, long_action_t], dtype=np.float32),
     }
+    if all(name in getattr(model, 'npy', {}) for name in ('nav_map', 'navigation')):
+      inputs.update(model_navigation_inputs(
+        sm['navAssistStateSP'], now_ns=time.monotonic_ns(),
+        healthy=sm.all_checks(['navAssistStateSP', 'carState', 'carControl']),
+        control_active=sm['carControl'].latActive, turn_active=DH.turn_maneuver.state == 'active',
+        driver_override=sm['carState'].brakePressed or sm['carState'].steeringPressed or sm['carState'].gasPressed,
+      ))
 
     # Jetlink uses control state and dropped-frame share to decide safe handovers.
     model.in_control = jetlink_adapter.in_control(sm)

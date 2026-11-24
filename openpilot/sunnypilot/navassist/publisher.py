@@ -42,7 +42,8 @@ def _phone_observations_valid(snapshot) -> bool:
   )
 
 
-def build_nav_assist_message(current: AcceptedSnapshot | None, now_ns: int, *, local_localization_valid: bool = False):
+def build_nav_assist_message(current: AcceptedSnapshot | None, now_ns: int, *, local_localization_valid: bool = False,
+                             model_input=None, map_frame=None):
   message = messaging.new_message("navAssistStateSP")
   state = message.navAssistStateSP
   state.publishMonoTime = now_ns
@@ -103,6 +104,16 @@ def build_nav_assist_message(current: AcceptedSnapshot | None, now_ns: int, *, l
   state.turnSignalCountdownS = snapshot.turn_signal_countdown_s
   state.laneGuidanceObservedAtMs = snapshot.lane_guidance_observed_at_ms
   state.sourceAgeMs = current.age_ms(now_ns)
+  if (model_input is not None and map_frame is not None and not stale
+      and model_input.sequence == snapshot.sequence
+      and model_input.route.session_id == snapshot.session_id and model_input.route.route_revision == snapshot.route_revision):
+    from openpilot.sunnypilot.navassist.map_input import MAP_MAX_AGE_NS, route_key
+    if (map_frame.route_key == route_key(model_input) and len(map_frame.pixels) == 256 * 256
+        and 0 <= now_ns - map_frame.mono_time_ns <= MAP_MAX_AGE_NS):
+      state.modelInputValid = True
+      state.modelMap = map_frame.pixels
+      state.modelNavigation = model_input.navigation
+      state.modelMapMonoTime = map_frame.mono_time_ns
   lane_guidance_age_ms = snapshot.source_wall_time_ms - snapshot.lane_guidance_observed_at_ms
   # AMap lane guidance is held between show/hide events. Each full snapshot
   # carries the current lanes; its transport TTL owns liveness, not callback age.
